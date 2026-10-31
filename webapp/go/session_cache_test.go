@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -73,6 +74,9 @@ func newTestSessionCache(region string) (*sessionCache, *fakeClock) {
 }
 
 func TestSessionCacheRegionsDefault(t *testing.T) {
+	if value := os.Getenv("ISUREAL_SESSION_CACHE_REGIONS"); value != "" {
+		t.Skipf("ISUREAL_SESSION_CACHE_REGIONS=%q overrides the default", value)
+	}
 	if !sessionCacheRegions["europe"] || !sessionCacheRegions["america"] || sessionCacheRegions["asia"] {
 		t.Fatalf("default cache regions = %v, want europe and america only", sessionCacheRegions)
 	}

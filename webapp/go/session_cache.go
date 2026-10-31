@@ -30,9 +30,13 @@ import (
 // そのクエリのスナップショットはコミットを含むので、無効になったセッションは有効と判定されない。
 // コミットより前に送られたクエリで入ったエントリは、r の時点で TTL を過ぎているので使われない。
 //
-// asia は asia1 と asia2 の2プロセスに分かれ、/api/auth/ は asia1 だけが処理する。
-// asia のアプリと DB の往復は約1ms で効果が小さいので、既定ではキャッシュしない（ISUREAL_SESSION_CACHE_REGIONS）。
-// 全サーバで同じ設定にすること（書く側は、この設定で待つかどうかを決める）。
+// 既定では europe と america だけをキャッシュする（ISUREAL_SESSION_CACHE_REGIONS）。
+// asia を外していたのは、asia のアプリが asia1 と asia2 の2プロセスに分かれていて、往復も約1ms で効果が小さいと見ていたため。
+// 今は asia2 のアプリを止めていて asia も1プロセスなので、asia を足して ISUREAL_SESSION_CACHE_SOLE=1 にすれば、
+// asia1 の認証付きの全リクエストからセッションの確認の1往復（DB の接続1本と asia2 の CPU）が減り、
+// GET /api/me もキャッシュした利用者の行で応答できる（#109、docs/session-cache-asia.md）。
+// 切り替えは既定値ではなく env.sh で行う。全サーバで同じ設定にすること（書く側は、この設定で待つかどうかを決める）。
+// asia2 のアプリを再び動かすときは、asia のプロセスが2つになるので、全サーバから ISUREAL_SESSION_CACHE_SOLE を外すこと。
 //
 // 待ちの省略（#62）：キャッシュに入れるのは、そのプロセスのリージョンの利用者だけ（put）。
 // そのため、あるリージョンをキャッシュするプロセスが1つだけなら、そのリージョンの利用者のセッションを
@@ -59,7 +63,7 @@ var (
 	sessionCacheInterval = time.Duration(envInt64("ISUREAL_SESSION_CACHE_INTERVAL_MS", 100)) * time.Millisecond
 	sessionCacheMax      = int(envInt64("ISUREAL_SESSION_CACHE_MAX", 100000))
 	// このプロセスのリージョンをキャッシュするのは、このプロセスだけであることを示す（#62）。
-	// 同じリージョンのアプリを2つ以上動かすときは、どのプロセスにも設定しないこと。
+	// 同じリージョンのアプリを2つ以上動かすとき（asia2 のアプリを動かす docs/asia-role-split.md の構成）は、どのプロセスにも設定しないこと。
 	sessionCacheSole = parseSessionCacheSole(os.Getenv("ISUREAL_SESSION_CACHE_SOLE"))
 	// evictedAt を覚えておく時間。確かめ直しのクエリは sessionCacheTTL で打ち切るので、それより十分に長くする。
 	// これより古い evictedAt を忘れても、そのころに送ったクエリの結果は TTL を過ぎていて put されない。
