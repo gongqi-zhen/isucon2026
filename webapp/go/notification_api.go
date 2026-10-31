@@ -1,9 +1,7 @@
 package isureal
 
 import (
-	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -75,22 +73,17 @@ func getNotificationsHandler(h *HandlerContext) echo.HandlerFunc {
 				return send(notification)
 			case <-waiter.changed:
 			}
-			// ハブがまとめて引けなかったとき（購読した直後、クエリの失敗）は、以前と同じくこの接続で引く。
-			var notification getNotificationsResponse
-			err := h.DB.GetContext(ctx, &notification, `
-    SELECT n.id, n.posting_window_id, w.region, n.created_at
-    FROM notifications n JOIN posting_windows w ON w.id = n.posting_window_id
-    WHERE n.user_id = $1 AND n.created_at > $2 AND w.ended_at IS NULL
-    ORDER BY n.created_at, n.id LIMIT 1
-   `, userID, connectedAt)
-			if err == nil {
-				return send(notification)
-			}
-			if !errors.Is(err, sql.ErrNoRows) {
+			// ハブがまとめて引いたときに接続した時刻がまだ決まっていなかったら、この接続で引く。
+			// 同時に引く接続どうしは、1回のクエリにまとめる（#83）。通知がなければ、次に知らされるまで待つ。
+			notification, err := hub.fetcher.get(ctx, notificationKey{UserID: userID, ConnectedAt: connectedAt})
+			if err != nil {
 				if ctx.Err() == nil {
 					c.Logger().Error("failed to get notification", "error", err)
 				}
 				return nil
+			}
+			if notification != nil {
+				return send(*notification)
 			}
 		}
 	}

@@ -3,6 +3,7 @@ package isureal
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"slices"
 	"sync"
@@ -20,6 +21,8 @@ import (
 //     ポーリングは、LISTEN の接続が切れているときなどの取りこぼしの保険として残す。
 //   - 変化を見つけたら、待っている全員の通知を1クエリで引き、各接続に渡す。
 //     以前は各接続がそれぞれ1クエリずつ引いていたので、投稿期間の開始の直後に DB の接続プールを取り合っていた。
+//   - まとめて引けなかった接続（接続した時刻がまだ決まっていなかった接続）が自分で引くときも、
+//     同時に引くものどうしを1クエリにまとめる（notificationFetcher、#83）。
 const (
 	notificationWindowPollInterval = 100 * time.Millisecond
 	notificationUserCheckInterval  = 500 * time.Millisecond
@@ -196,13 +199,24 @@ type NotificationHub struct {
 	// LISTEN で投稿期間の開始を受け取ったときに、すぐ確認させる。
 	wake               chan struct{}
 	windowPollInterval time.Duration
+	// まとめ取りの失敗を最後にログに出した時刻。run の goroutine だけが読み書きする。
+	batchErrorLoggedAt time.Time
+	// changed で知らされた接続が自分で通知を引くときに使う。source が notificationBatchSource のときだけ設定する。
+	fetcher *notificationFetcher
 }
 
 func newNotificationHub(source notificationSource) *NotificationHub {
-	return &NotificationHub{
+	hub := &NotificationHub{
 		source: source, waiters: map[*notificationWaiter]struct{}{},
 		wake: make(chan struct{}, 1), windowPollInterval: notificationWindowPollInterval,
 	}
+	if batch, ok := source.(notificationBatchSource); ok {
+		hub.fetcher = newNotificationFetcher(func(ctx context.Context, keys []notificationKey) ([]*getNotificationsResponse, error) {
+			_, pending, err := batch.PendingNotifications(ctx, keys)
+			return pending, err
+		})
+	}
+	return hub
 }
 
 var (
@@ -307,9 +321,11 @@ func (hub *NotificationHub) checkWindowsNow(ctx context.Context) {
 }
 
 // deliverPending は、待機中の全員の通知を1クエリで引き、見つかった接続に渡す。
-//   - 接続した時刻がまだ決まっていない接続には、以前と同じく changed で知らせる（その接続が自分で引く）。
+//   - 接続した時刻がまだ決まっていない接続には、以前と同じく changed で知らせる（その接続が notificationFetcher で引く）。
 //   - 通知が見つからなかった接続は、以前の「引いたが行がなかった」と同じく、そのまま待たせる。
-//   - クエリが失敗したら、以前と同じく全員に changed で知らせ、各接続が自分で引く。次回の確認でも必ず全員に知らせる。
+//   - クエリが失敗したら、各接続には知らせず、次回の確認（windowPollInterval 後）でもう一度まとめて引く（#83）。
+//     以前は全員に changed で知らせていたので、DB が重いときに、待っている接続の数だけクエリが接続プールを取り合っていた。
+//     接続が自分で引くのも同じクエリで、失敗すると接続を閉じてしまうので、失敗が続いてもハブで引き直す。
 func (hub *NotificationHub) deliverPending(ctx context.Context, batch notificationBatchSource) {
 	waiters := hub.snapshot()
 	ready := make([]*notificationWaiter, 0, len(waiters))
@@ -325,9 +341,11 @@ func (hub *NotificationHub) deliverPending(ctx context.Context, batch notificati
 	}
 	windows, pending, err := batch.PendingNotifications(ctx, keys)
 	if err != nil {
+		// nil にしておけば、次回の checkWindows は一覧が同じでも必ずまとめて引く。
 		hub.windows = nil
-		for _, waiter := range ready {
-			waiter.signal()
+		if time.Since(hub.batchErrorLoggedAt) > time.Minute {
+			log.Printf("failed to fetch pending notifications (retrying on the next check): %v", err)
+			hub.batchErrorLoggedAt = time.Now()
 		}
 		return
 	}
@@ -359,6 +377,85 @@ func (hub *NotificationHub) checkUsers(ctx context.Context) {
 	for _, waiter := range waiters {
 		if region, ok := regions[waiter.userID]; !ok || region != waiter.region {
 			waiter.markGone()
+		}
+	}
+}
+
+// notificationFetcher は、changed で知らされた接続（ハブがまとめて引いたときに、接続した時刻がまだ決まっていなかった接続）が
+// 自分で通知を引く問い合わせを、まとめて引く（#83）。以前は接続ごとに1クエリずつ引いていた。
+//   - 引いていなければ、すぐに引く。1つだけなら、接続ごとに引いていたときと同じく DB の1往復で返る。
+//   - 引いている間に来た問い合わせは、それが終わった後の1回にまとめる。
+//
+// europe と america では、ハブの goroutine はポーリング（100ms ごとに約100ms の往復）でほとんど埋まっているので、
+// ハブに引かせると、ポーリングの終わりを待つ分だけ遅れる。そのため、ハブとは別の goroutine で引く。
+type notificationFetcher struct {
+	fetch   func(ctx context.Context, keys []notificationKey) ([]*getNotificationsResponse, error)
+	mu      sync.Mutex
+	running bool
+	queue   []*notificationFetchRequest
+}
+
+type notificationFetchRequest struct {
+	ctx    context.Context
+	key    notificationKey
+	result chan notificationFetchResult
+}
+
+type notificationFetchResult struct {
+	notification *getNotificationsResponse
+	err          error
+}
+
+// fetch には、keys のそれぞれについて getNotificationsHandler が1件目に返す通知を、keys と同じ順に返す関数を渡す（ないキーは nil）。
+func newNotificationFetcher(fetch func(ctx context.Context, keys []notificationKey) ([]*getNotificationsResponse, error)) *notificationFetcher {
+	return &notificationFetcher{fetch: fetch}
+}
+
+// get は key の通知を返す。なければ nil を返す。
+func (f *notificationFetcher) get(ctx context.Context, key notificationKey) (*getNotificationsResponse, error) {
+	request := &notificationFetchRequest{ctx: ctx, key: key, result: make(chan notificationFetchResult, 1)}
+	f.mu.Lock()
+	f.queue = append(f.queue, request)
+	if !f.running {
+		f.running = true
+		go f.run()
+	}
+	f.mu.Unlock()
+	select {
+	case result := <-request.result:
+		return result.notification, result.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// run は、たまった問い合わせがなくなるまで、まとめて引いて返す。
+// 接続が閉じた問い合わせは引かない。どの接続のものでもないので、クエリは接続の context では打ち切らない。
+func (f *notificationFetcher) run() {
+	for {
+		f.mu.Lock()
+		requests := slices.DeleteFunc(f.queue, func(r *notificationFetchRequest) bool { return r.ctx.Err() != nil })
+		f.queue = nil
+		if len(requests) == 0 {
+			f.running = false
+			f.mu.Unlock()
+			return
+		}
+		f.mu.Unlock()
+		keys := make([]notificationKey, len(requests))
+		for i, request := range requests {
+			keys[i] = request.key
+		}
+		pending, err := f.fetch(context.Background(), keys)
+		if err == nil && len(pending) != len(keys) {
+			err = fmt.Errorf("pending notifications: got %d results for %d keys", len(pending), len(keys))
+		}
+		for i, request := range requests {
+			if err != nil {
+				request.result <- notificationFetchResult{err: err}
+			} else {
+				request.result <- notificationFetchResult{notification: pending[i]}
+			}
 		}
 	}
 }

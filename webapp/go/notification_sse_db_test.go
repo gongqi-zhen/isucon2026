@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -127,7 +128,8 @@ func TestNotificationSSEDelivery(t *testing.T) {
 	env.expectNotification(t, late, got, nextWindowID)
 }
 
-// PendingNotifications が、接続ごとのクエリ（getNotificationsHandler のフォールバック）と同じ通知を返すこと。
+// PendingNotifications が、以前の接続ごとのクエリ（#83 より前の getNotificationsHandler のフォールバック）と同じ通知を返すこと。
+// 今は、changed で知らされた接続も、notificationFetcher から PendingNotifications で引く。
 // JSON にしたときの文字列（時刻の書式とタイムゾーン）まで同じであること。
 func TestNotificationPendingMatchesPerConnectionQuery(t *testing.T) {
 	env := newLockTestEnv(t)
@@ -194,6 +196,50 @@ func TestNotificationPendingMatchesPerConnectionQuery(t *testing.T) {
 	// a は beforeFirst と between、b は2つとも見つかる（開いている2つ目の投稿期間の通知）。
 	if found != 4 {
 		t.Fatalf("found %d notifications, want 4", found)
+	}
+}
+
+// #83：changed で知らされた接続が notificationFetcher で同時に引いても、それぞれの接続の通知が返ること。
+func TestNotificationFetcherWithDB(t *testing.T) {
+	env := newLockTestEnv(t)
+	admin := env.adminToken()
+	hub := newNotificationHub(dbNotificationSource{db: env.db})
+	clock := func() time.Time {
+		var now time.Time
+		if err := env.db.Get(&now, `SELECT clock_timestamp()`); err != nil {
+			t.Fatal(err)
+		}
+		return now
+	}
+	users := []lockTestUser{env.user("asia"), env.user("asia"), env.user("asia")}
+	connectedAt := clock()
+	windowID := env.mustOpenWindow(admin)
+	afterOpen := clock()
+
+	ctx := context.Background()
+	results := make([]*getNotificationsResponse, len(users))
+	errs := make([]error, len(users))
+	var wg sync.WaitGroup
+	for i, u := range users {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i], errs[i] = hub.fetcher.get(ctx, notificationKey{UserID: u.id, ConnectedAt: connectedAt})
+		}()
+	}
+	wg.Wait()
+	for i, u := range users {
+		if errs[i] != nil {
+			t.Fatalf("user %d: %v", i, errs[i])
+		}
+		if results[i] == nil {
+			t.Fatalf("user %d: notification not found", i)
+		}
+		env.expectNotification(t, u, *results[i], windowID)
+	}
+	// 投稿期間の開始より後に接続した人には、その投稿期間の通知はない。
+	if got, err := hub.fetcher.get(ctx, notificationKey{UserID: users[0].id, ConnectedAt: afterOpen}); err != nil || got != nil {
+		t.Fatalf("connected after opening: got %v %v, want none", got, err)
 	}
 }
 
