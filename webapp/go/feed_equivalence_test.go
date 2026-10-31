@@ -276,7 +276,7 @@ func legacyMatchesFeed(viewer viewerContext, following map[string]bool, post Pos
 // ===== 比較テスト =====
 
 // 署名付き画像URLの exp と sig は生成した秒によって変わるので、比較の前に取り除く。
-var signedURLQuery = regexp.MustCompile(`\?exp=[0-9]+&sig=[A-Za-z0-9_-]+`)
+var signedURLQuery = regexp.MustCompile(`\?exp=[0-9]+(&|\\u0026)sig=[A-Za-z0-9_-]+`)
 
 func normalizedJSON(t *testing.T, value any) string {
 	t.Helper()
@@ -299,7 +299,8 @@ func envInt(name string, fallback int) int {
 //	ISUREAL_TEST_DSN=postgres://isureal:isureal@127.0.0.1:5432/isureal go test -tags equivalence -run TestEquivalenceWithLegacy -v ./...
 //
 // 開いている投稿期間に投稿があるほど比較の意味が大きいので、負荷走行の直後の DB に対して実行するとよい。
-// ISUREAL_TEST_SEED=1 を付けると、001-schema.sql だけを流した空の DB に合成データを入れてから比較する。
+// ISUREAL_TEST_SEED=<正の整数> を付けると、001-schema.sql だけを流した空の DB に、その値を乱数の種にした合成データを入れてから比較する。
+// 合成データのユーザー数は ISUREAL_TEST_SEED_USERS（既定 80）で変えられる（ページングまで確かめるには 250 程度）。
 // ISUREAL_TEST_USERS（既定 300）、ISUREAL_TEST_POSTS（既定 300）、ISUREAL_TEST_PAGES（既定 3）で件数を変えられる。
 func TestEquivalenceWithLegacy(t *testing.T) {
 	dsn := os.Getenv("ISUREAL_TEST_DSN")
@@ -312,8 +313,8 @@ func TestEquivalenceWithLegacy(t *testing.T) {
 	}
 	defer db.Close()
 	ctx := context.Background()
-	if os.Getenv("ISUREAL_TEST_SEED") == "1" {
-		seedEquivalenceData(t, db)
+	if seed := envInt("ISUREAL_TEST_SEED", 0); seed > 0 {
+		seedEquivalenceData(t, db, uint64(seed))
 	}
 
 	var userIDs []string
@@ -367,6 +368,7 @@ func TestEquivalenceWithLegacy(t *testing.T) {
 				if !legacy.HasMore {
 					break
 				}
+				compared["feed-next-page:"+feed]++
 				last := legacy.Items[len(legacy.Items)-1]
 				postedAt := last.PostedAt
 				input = getFeedRequest{Feed: feed, BeforePostedAt: &postedAt, BeforeID: last.ID, BeforeScore: last.Score}
@@ -406,10 +408,10 @@ func TestEquivalenceWithLegacy(t *testing.T) {
 }
 
 // seedEquivalenceData は空の DB に、友達・フォロー・ブロック・投稿期間・投稿・RealMoji・コメントの合成データを入れる。
-// 乱数の種は固定なので、何度実行しても同じデータになる。
-func seedEquivalenceData(t *testing.T, db *sqlx.DB) {
+// 同じ種なら、何度実行しても同じデータになる。
+func seedEquivalenceData(t *testing.T, db *sqlx.DB, seed uint64) {
 	t.Helper()
-	rng := rand.New(rand.NewPCG(1, 2))
+	rng := rand.New(rand.NewPCG(seed, 2))
 	exec := func(query string, args ...any) {
 		t.Helper()
 		if _, err := db.Exec(query, args...); err != nil {
@@ -417,7 +419,7 @@ func seedEquivalenceData(t *testing.T, db *sqlx.DB) {
 		}
 	}
 	regions := []string{"asia", "europe", "america"}
-	const users = 80
+	users := envInt("ISUREAL_TEST_SEED_USERS", 80)
 	userID := func(i int) string { return fmt.Sprintf("00000000-0000-4000-8000-%012d", i) }
 	for i := 0; i < users; i++ {
 		accountType, status := "regular", "active"
