@@ -184,38 +184,70 @@ func listMemories(ctx context.Context, db sqlx.QueryerContext, userID string, st
 	if response.HasMore {
 		rows = rows[:50]
 	}
-	items := make([]memoryPostResponse, 0, len(rows))
-	for _, row := range rows {
+	// 先に全部の行を読み、出てくる画像の署名をまとめて計算しておく（presignImageURLs、#127）。
+	// Memories は1回で数百枚の画像を返すことがあり、exp の丸めの境目のあとは、それを全部署名し直すことになる。
+	type parsedRow struct {
+		reactions, comments []memoryInteractionJSON
+		reactors, authors   []User
+	}
+	parsed := make([]parsedRow, len(rows))
+	var images []imageURLRequest
+	addProfileImage := func(user User) {
+		if user.ProfileImageID != nil {
+			images = append(images, imageURLRequest{user: user, imageID: *user.ProfileImageID})
+		}
+	}
+	for i := range rows {
+		row := &rows[i]
 		if err := row.Author.setImageKey(); err != nil {
 			return response, err
 		}
+		addProfileImage(row.Author)
+		images = append(images, imageURLRequest{user: row.Author, imageID: row.ImageID, createdAt: row.PostedAt})
+		p := &parsed[i]
+		if err := json.Unmarshal(row.RealMojisJSON, &p.reactions); err != nil {
+			return response, err
+		}
+		if err := json.Unmarshal(row.CommentsJSON, &p.comments); err != nil {
+			return response, err
+		}
+		for _, reaction := range p.reactions {
+			reactor, err := reaction.User.user()
+			if err != nil {
+				return response, err
+			}
+			p.reactors = append(p.reactors, reactor)
+			addProfileImage(reactor)
+			images = append(images, imageURLRequest{user: reactor, imageID: reaction.ImageID})
+		}
+		for _, comment := range p.comments {
+			author, err := comment.User.user()
+			if err != nil {
+				return response, err
+			}
+			p.authors = append(p.authors, author)
+			addProfileImage(author)
+		}
+	}
+	presignImageURLs(images)
+
+	items := make([]memoryPostResponse, 0, len(rows))
+	for i, row := range rows {
 		item := memoryPostResponse{
 			createPostResponse: newPostResponse(row.Post, row.Author),
 			RealMojis:          make([]replaceRealMojiResponse, 0),
 			Comments:           make([]createCommentResponse, 0),
 		}
-		var reactions, comments []memoryInteractionJSON
-		if err := json.Unmarshal(row.RealMojisJSON, &reactions); err != nil {
-			return response, err
-		}
-		if err := json.Unmarshal(row.CommentsJSON, &comments); err != nil {
-			return response, err
-		}
-		for _, reaction := range reactions {
-			reactor, err := reaction.User.user()
-			if err != nil {
-				return response, err
-			}
+		p := parsed[i]
+		for j, reaction := range p.reactions {
+			reactor := p.reactors[j]
 			item.RealMojis = append(item.RealMojis, newRealMojiResponse(RealMoji{
 				ID: reaction.ID, PostID: row.ID, ReactorID: reactor.ID, ImageID: reaction.ImageID,
 				ReactionType: reaction.ReactionType, CreatedAt: time.UnixMicro(reaction.CreatedAtMicros),
 			}, reactor))
 		}
-		for _, comment := range comments {
-			author, err := comment.User.user()
-			if err != nil {
-				return response, err
-			}
+		for j, comment := range p.comments {
+			author := p.authors[j]
 			item.Comments = append(item.Comments, newCommentResponse(Comment{
 				ID: comment.ID, PostID: row.ID, AuthorID: author.ID, Body: comment.Body,
 				CreatedAt: time.UnixMicro(comment.CreatedAtMicros),

@@ -68,6 +68,17 @@ func exportPostsHandler(h *HandlerContext) echo.HandlerFunc {
 			if chunk.err != nil {
 				abortExport(c, chunk.err)
 			}
+			// まとまりの画像の署名を先にまとめて計算しておく（presignImageURLs、#127）。
+			images := make([]imageURLRequest, 0, len(chunk.posts)+1)
+			if author.ProfileImageID != nil {
+				images = append(images, imageURLRequest{user: author, imageID: *author.ProfileImageID})
+			}
+			for _, post := range chunk.posts {
+				if _, found := chunk.images[post.ImageID]; found {
+					images = append(images, imageURLRequest{user: author, imageID: post.ImageID, createdAt: post.PostedAt})
+				}
+			}
+			presignImageURLs(images)
 			for _, post := range chunk.posts {
 				data, found := chunk.images[post.ImageID]
 				if !found {

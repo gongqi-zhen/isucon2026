@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"image/jpeg"
 	"time"
+
+	"example.com/isureal-company/isureal/internal/jpegcheck"
 )
 
 // validJPEGWithin は jpeg.Decode が成功し、縦横とも maxSide 以下なら true を返す。
@@ -21,6 +23,9 @@ import (
 //     Decode する。
 //   - サイズ内なら今まで通り Decode で全体を検証する。
 //
+// Decode の成否と大きさは、画素を復元しない jpegcheck.Check で求める（jpeg.Decode と同じ結果になる。#127）。
+// asia1 の CPU プロファイルで、jpeg.Decode の半分以上が画素の復元（逆 DCT と書き込み）だった。
+//
 // 失敗の理由（デコード失敗かサイズ超過か）は区別できなくなるので、
 // 両者で応答が同じ呼び出し元でだけ使うこと。
 func validJPEGWithin(data []byte, maxSide int) bool {
@@ -31,11 +36,11 @@ func validJPEGWithin(data []byte, maxSide int) bool {
 	if cfg.Width > 0 && cfg.Height > 0 && (cfg.Width > maxSide || cfg.Height > maxSide) {
 		return false
 	}
-	img, err := jpeg.Decode(bytes.NewReader(data))
+	width, height, err := jpegcheck.Check(bytes.NewReader(data))
 	if err != nil {
 		return false
 	}
-	return img.Bounds().Dx() <= maxSide && img.Bounds().Dy() <= maxSide
+	return width <= maxSide && height <= maxSide
 }
 
 // JPEG の検証結果のキャッシュ（#102）。
@@ -99,11 +104,11 @@ func cachedValidJPEGWithin(data []byte, maxSide int) bool {
 // profileImageCheck は、プロフィール画像の変更前の判定（全体をデコードしてから、縦横が 512 以下かを確かめる）。
 // デコードに失敗したら、サイズを見ずに jpegDecodeFailed にする（#30：サイズを先に見ると abuse のログが変わる）。
 func profileImageCheck(data []byte) jpegVerdict {
-	img, err := jpeg.Decode(bytes.NewReader(data))
+	width, height, err := jpegcheck.Check(bytes.NewReader(data))
 	if err != nil {
 		return jpegDecodeFailed
 	}
-	if img.Bounds().Dx() > 512 || img.Bounds().Dy() > 512 {
+	if width > 512 || height > 512 {
 		return jpegOversized
 	}
 	return jpegValid
