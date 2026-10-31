@@ -46,22 +46,25 @@ type realMojiListRow struct {
 // listRealMojisIfViewable は、閲覧権限の確認と、現在の RealMoji の一覧を1回のクエリで読む（#65）。
 // 権限は canViewPost と同じ判定（isureal_can_view）。権限がなければ false を返す。
 // 一覧は selectCurrentRealMojis と同じ条件と並び順で、before より前のものを最大51件返す。
-func listRealMojisIfViewable(ctx context.Context, db sqlx.QueryerContext, viewerID, postID string, beforeCreatedAt *time.Time, beforeID string) (bool, []RealMojiWithReactor, error) {
-	var rows []realMojiListRow
-	if err := sqlx.SelectContext(ctx, db, &rows, `
+// クエリの文字列は起動時に1回だけ組み立てる（#112）。
+var listRealMojisIfViewableQuery = `
   WITH access AS MATERIALIZED (SELECT isureal_can_view($1, $2) AS allowed)
   SELECT access.allowed, r.*
   FROM access
   LEFT JOIN LATERAL (
     SELECT r.id, r.post_id, r.reactor_id, r.image_id, r.reaction_type, r.created_at, r.replaced_at, r.deleted_at,
-           `+userColumnsAs("u", "reactor")+`
+           ` + userColumnsAs("u", "reactor") + `
     FROM realmojis r JOIN users u ON u.id = r.reactor_id AND u.status = 'active'
     WHERE access.allowed AND r.replaced_at IS NULL AND r.deleted_at IS NULL AND r.post_id = $2
       AND ($3::timestamptz IS NULL OR (r.created_at, r.id) < ($3, $4))
     ORDER BY r.created_at DESC, r.id DESC LIMIT 51
   ) r ON true
   ORDER BY r.created_at DESC, r.id DESC
- `, viewerID, postID, beforeCreatedAt, beforeID); err != nil {
+ `
+
+func listRealMojisIfViewable(ctx context.Context, db sqlx.QueryerContext, viewerID, postID string, beforeCreatedAt *time.Time, beforeID string) (bool, []RealMojiWithReactor, error) {
+	var rows []realMojiListRow
+	if err := sqlx.SelectContext(ctx, db, &rows, listRealMojisIfViewableQuery, viewerID, postID, beforeCreatedAt, beforeID); err != nil {
 		return false, nil, err
 	}
 	if len(rows) == 0 || !rows[0].Allowed {
@@ -87,13 +90,15 @@ func listRealMojisIfViewable(ctx context.Context, db sqlx.QueryerContext, viewer
 	return true, reactions, nil
 }
 
+var selectCurrentRealMojisQuery = `
+  SELECT r.id, r.post_id, r.reactor_id, r.image_id, r.reaction_type, r.created_at, r.replaced_at, r.deleted_at,
+         ` + userColumnsAs("u", "reactor") + `
+  FROM realmojis r JOIN users u ON u.id = r.reactor_id AND u.status = 'active'
+  WHERE r.replaced_at IS NULL AND r.deleted_at IS NULL `
+
 func selectCurrentRealMojis(ctx context.Context, db sqlx.QueryerContext, conditions string, args ...any) ([]RealMojiWithReactor, error) {
 	var reactions []RealMojiWithReactor
-	if err := sqlx.SelectContext(ctx, db, &reactions, `
-  SELECT r.id, r.post_id, r.reactor_id, r.image_id, r.reaction_type, r.created_at, r.replaced_at, r.deleted_at,
-         `+userColumnsAs("u", "reactor")+`
-  FROM realmojis r JOIN users u ON u.id = r.reactor_id AND u.status = 'active'
-  WHERE r.replaced_at IS NULL AND r.deleted_at IS NULL `+conditions, args...); err != nil {
+	if err := sqlx.SelectContext(ctx, db, &reactions, selectCurrentRealMojisQuery+conditions, args...); err != nil {
 		return nil, err
 	}
 	for i := range reactions {

@@ -130,7 +130,7 @@ func newPostResponse(post Post, user User) createPostResponse {
 		ID: post.ID,
 		Author: postAuthorResponse{
 			ID: user.ID, Username: user.Username, DisplayName: user.DisplayName,
-			ProfileImageURL: newGetMeResponse(user).ProfileImageURL,
+			ProfileImageURL: profileImageURL(user),
 			Bio:             user.Bio, AccountType: user.AccountType,
 		},
 		PostingWindowID: post.PostingWindowID, ImageURL: signedImageURLAt(user, post.ImageID, post.PostedAt),
@@ -145,6 +145,18 @@ func newPostResponse(post Post, user User) createPostResponse {
 
 type getMyCurrentPostResponse createPostResponse
 
+// クエリの文字列は起動時に1回だけ組み立てる（#112）。
+var myCurrentPostQuery = `
+   SELECT ` + postColumns + `, ` + userColumnsAs("u", "author") + `
+   FROM posts p
+   JOIN posting_windows w ON w.id = p.posting_window_id
+   JOIN users u ON u.id = p.author_id
+   JOIN posting_windows current ON current.region = u.region AND current.ended_at IS NULL
+                              AND current.local_date = w.local_date
+   WHERE p.author_id = $1 AND p.deleted_at IS NULL
+   LIMIT 1
+  `
+
 func getMyCurrentPostHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		ctx := c.Request().Context()
@@ -154,16 +166,7 @@ func getMyCurrentPostHandler(h *HandlerContext) echo.HandlerFunc {
 			Post
 			Author User `db:"author"`
 		}
-		err := h.DB.GetContext(ctx, &post, `
-   SELECT `+postColumns+`, `+userColumnsAs("u", "author")+`
-   FROM posts p
-   JOIN posting_windows w ON w.id = p.posting_window_id
-   JOIN users u ON u.id = p.author_id
-   JOIN posting_windows current ON current.region = u.region AND current.ended_at IS NULL
-                              AND current.local_date = w.local_date
-   WHERE p.author_id = $1 AND p.deleted_at IS NULL
-   LIMIT 1
-  `, userID)
+		err := h.DB.GetContext(ctx, &post, myCurrentPostQuery, userID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewAPIError(http.StatusNotFound, "post_not_found")
 		}

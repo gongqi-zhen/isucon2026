@@ -136,8 +136,43 @@ func (c feedCandidate) viewer(viewerID string) viewerContext {
 // 閲覧者が active でないか今日まだ投稿していなければ、候補は0件になる（canView はすべて false なので）。
 func selectFeedCandidates(ctx context.Context, db sqlx.QueryerContext, viewerID string, input getFeedRequest) ([]feedCandidate, error) {
 	ranked := input.Feed == "friends-of-friends"
+	args := []any{viewerID, input.BeforePostedAt, input.BeforeID}
+	if ranked {
+		// candidates の ($2, $3) の絞り込みは使わない（スコアの順でページ送りする）。
+		args = []any{viewerID, nil, "", input.BeforeScore, input.BeforePostedAt, input.BeforeID}
+	}
+	query, ok := feedCandidatesQueries[input.Feed]
+	if !ok {
+		query = feedCandidatesQuery(input.Feed)
+	}
+	var posts []feedCandidate
+	if err := sqlx.SelectContext(ctx, db, &posts, query, args...); err != nil {
+		return nil, err
+	}
+	for i := range posts {
+		if err := posts[i].Author.setImageKey(); err != nil {
+			return nil, err
+		}
+	}
+	return posts, nil
+}
+
+// feedCandidatesQueries は、フィードの種類ごとのクエリの文字列。起動時に1回だけ組み立て、リクエストごとには組み立てない（#112）。
+// 文字列は feedCandidatesQuery が返すものと同じなので、pgx の文のキャッシュにもそのまま当たる。
+var feedCandidatesQueries = func() map[string]string {
+	queries := map[string]string{}
+	for _, feed := range []string{"friends", "friends-of-friends", "following", "public"} {
+		queries[feed] = feedCandidatesQuery(feed)
+	}
+	return queries
+}()
+
+// feedCandidatesQuery は、selectFeedCandidates が送るクエリの文字列を組み立てる。
+// 引数は $1 = 閲覧者、$2 = beforePostedAt、$3 = beforeID。friends-of-friends ではさらに $4 = beforeScore、$5 = beforePostedAt、$6 = beforeID。
+func feedCandidatesQuery(feed string) string {
+	ranked := feed == "friends-of-friends"
 	feedCondition := ""
-	switch input.Feed {
+	switch feed {
 	case "friends":
 		feedCondition = `AND p.author_id = ANY(viewer.friends)`
 	case "friends-of-friends":
@@ -160,7 +195,6 @@ func selectFeedCandidates(ctx context.Context, db sqlx.QueryerContext, viewerID 
   SELECT c.*, 0::bigint AS mutual_friends, 0::bigint AS friend_engagements, 0::bigint AS author_connections, 0::bigint AS score
   FROM candidates c
   ORDER BY c.posted_at DESC, c.id DESC`
-	args := []any{viewerID, input.BeforePostedAt, input.BeforeID}
 	if ranked {
 		candidateLimit = ""
 		selection = `,
@@ -200,11 +234,8 @@ func selectFeedCandidates(ctx context.Context, db sqlx.QueryerContext, viewerID 
   WHERE ($4::bigint IS NULL OR (s.score, s.posted_at, s.id) < ($4, $5::timestamptz, $6))
   ORDER BY s.score DESC, s.posted_at DESC, s.id DESC
   LIMIT 51`
-		// candidates の ($2, $3) の絞り込みは使わない（スコアの順でページ送りする）。
-		args = []any{viewerID, nil, "", input.BeforeScore, input.BeforePostedAt, input.BeforeID}
 	}
-	var posts []feedCandidate
-	if err := sqlx.SelectContext(ctx, db, &posts, fmt.Sprintf(`
+	return fmt.Sprintf(`
   WITH `+viewerFriendsCTE+`,
   viewer AS (
     SELECT
@@ -247,15 +278,7 @@ func selectFeedCandidates(ctx context.Context, db sqlx.QueryerContext, viewerID 
     ORDER BY p.posted_at DESC, p.id DESC
     %s
   )%s
- `, feedCondition, candidateLimit, selection), args...); err != nil {
-		return nil, err
-	}
-	for i := range posts {
-		if err := posts[i].Author.setImageKey(); err != nil {
-			return nil, err
-		}
-	}
-	return posts, nil
+ `, feedCondition, candidateLimit, selection)
 }
 
 // mapKeys は値が true のキーの和集合を返す。SQL の配列パラメータに使うので、空でも nil にはしない。
