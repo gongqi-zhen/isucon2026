@@ -145,7 +145,7 @@ func logoutHandler(h *HandlerContext) echo.HandlerFunc {
 		if session == nil {
 			return NewAPIError(http.StatusUnauthorized, "invalid_session")
 		}
-		if err := InvalidateLoginSession(h.DB, session.UserID, session.TokenHash); err != nil {
+		if err := InvalidateLoginSession(c.Request().Context(), h.DB, session.UserID, session.TokenHash); err != nil {
 			return err
 		}
 		waitSessionInvalidation(c.Request().Context(), session.Region, session.UserID)

@@ -115,53 +115,20 @@ func SessionMiddleware(handlerContext *HandlerContext, authRequired bool) echo.M
 	}
 }
 
-func InvalidateLoginSession(db *sqlx.DB, userID string, tokenHash string) error {
-	tx, err := db.Beginx()
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	var lockedUserID string
-	if err := tx.Get(&lockedUserID, `SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID); err != nil {
-		return fmt.Errorf("failed to lock user: %w", err)
-	}
-
-	if _, err := tx.Exec(`
+// InvalidateLoginSession は、ログアウトしたトークンのセッションを無効にする。autocommit の1文で行う（#84）。
+// users の行はロックしない。以前はロックしたまま往復していたので、europe と america では約200ms、
+// その利用者の投稿へのコメントや RealMoji、友達関係の操作を待たせていた。
+// 同じ利用者のログイン（isureal_login）や退会と同時に動いても、同じ login_sessions の行への UPDATE どうしで直列になる。
+// 後の UPDATE は先のコミットを待ってから active を確かめ直すので、どちらの順でもそのトークンは無効になる（違うのは reason だけ）。
+func InvalidateLoginSession(ctx context.Context, db *sqlx.DB, userID string, tokenHash string) error {
+	if _, err := db.ExecContext(ctx, `
 		UPDATE login_sessions
 		SET active = false, invalidated_at = clock_timestamp(), reason = 'logout'
-		WHERE user_id = $1 AND active = true AND token_hash = $2	
+		WHERE user_id = $1 AND active = true AND token_hash = $2
 	`, userID, tokenHash); err != nil {
 		return fmt.Errorf("failed to invalidate sessions: %w", err)
 	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
 	return nil
-}
-
-// 2026-09-03: リファクタリング後にこの関数の利用がないようです。消すのはいかがでしょうか
-func CreateLoginSession(db *sqlx.DB, userID string) (*Session, error) {
-	ctx := context.Background()
-	tx, err := db.BeginTxx(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
-	var lockedUserID string
-	if err := tx.GetContext(ctx, &lockedUserID, `SELECT id FROM users WHERE id = $1 AND status = 'active' FOR NO KEY UPDATE`, userID); err != nil {
-		return nil, fmt.Errorf("failed to lock user: %w", err)
-	}
-	session, err := createLoginSessionTx(ctx, tx, userID)
-	if err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("failed to commit transaction: %w", err)
-	}
-	return session, nil
 }
 
 // newLoginSessionToken は、新しいセッションのトークンと、DB に保存するそのハッシュを返す。
@@ -169,28 +136,4 @@ func newLoginSessionToken() (token, tokenHash string) {
 	token = uuid.NewString()
 	hash := sha256.Sum256([]byte(token))
 	return token, hex.EncodeToString(hash[:])
-}
-
-// createLoginSessionTx は呼び出し元が users の行を FOR NO KEY UPDATE でロックし、active であることを確かめた後に呼ぶ。
-// europe と america から DB への1往復は約100ms なので、既存セッションの無効化と新しいセッションの追加を1つの文で行う。
-// CTE の UPDATE は本体の INSERT と同じスナップショットで動くので、追加した行は無効化されない。
-// ログイン（loginHandler）は、同じ処理を DB の関数 isureal_login（migrate.sql）で行う（#67）。
-func createLoginSessionTx(ctx context.Context, tx *sqlx.Tx, userID string) (*Session, error) {
-	randomToken, tokenHash := newLoginSessionToken()
-	sessionID := uuid.NewString()
-	var session Session
-	if err := tx.GetContext(ctx, &session, `
-  WITH invalidated AS (
-    UPDATE login_sessions
-    SET active = false, invalidated_at = clock_timestamp(), reason = 'replaced'
-    WHERE user_id = $2 AND active = true
-  )
-  INSERT INTO login_sessions (id, user_id, token_hash)
-  VALUES ($1, $2, $3)
-  RETURNING user_id, token_hash, created_at
- `, sessionID, userID, tokenHash); err != nil {
-		return nil, fmt.Errorf("failed to create session: %w", err)
-	}
-	session.Token = randomToken
-	return &session, nil
 }
