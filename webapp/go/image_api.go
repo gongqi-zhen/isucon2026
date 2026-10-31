@@ -43,7 +43,7 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 
 		ctx := c.Request().Context()
 		startImageInvalidationPoller(h.DB)
-		verifiedKey := input.ImageID + "\x00" + input.Exp + "\x00" + input.Sig
+		verifiedKey := verifiedSignatureKey(input.ImageID, input.Exp, input.Sig)
 		if _, verified := verifiedSignatureCache.Get(verifiedKey); !verified {
 			owner, cached := imageOwnerKeyCache.Get(input.ImageID)
 			if !cached {
