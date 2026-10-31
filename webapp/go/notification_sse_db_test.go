@@ -17,7 +17,7 @@ import (
 )
 
 // #60 の SSE 通知の配信を、実際の PostgreSQL と HTTP ハンドラで確かめる。
-// ISUREAL_TEST_DSN に、001-schema.sql、migrate.sql、interaction_functions.sql を流した DB を指定したときだけ実行する。
+// ISUREAL_TEST_DSN に、001-schema.sql、migrate.sql、interaction_functions.sql、posting_window_functions.sql を流した DB を指定したときだけ実行する。
 
 type sseStream struct {
 	events chan string
