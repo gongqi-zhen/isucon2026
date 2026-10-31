@@ -25,7 +25,8 @@ DELETE FROM users WHERE created_at > (SELECT created_at FROM initial_data_bounda
 
 UPDATE users u
 SET display_name = i.display_name, bio = i.bio, profile_image_id = i.profile_image_id, region = i.region,
-    account_type = i.account_type, status = i.status, deleted_at = i.deleted_at, updated_at = i.updated_at
+    account_type = i.account_type, status = i.status, deleted_at = i.deleted_at, updated_at = i.updated_at,
+    search_text = CASE WHEN u.display_name = i.display_name THEN u.search_text ELSE isureal_search_text(u.username, i.display_name) END
 FROM initial_users i
 WHERE u.id = i.id
   AND (u.display_name, u.bio, u.profile_image_id, u.region, u.account_type, u.status, u.deleted_at, u.updated_at)

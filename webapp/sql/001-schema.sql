@@ -214,3 +214,20 @@ CREATE TABLE ip_bans (
   banned_until timestamptz NOT NULL,
   created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
+
+-- 検索条件に合わせたインデックス（既存のDBには migrate.sql で同じものを適用する）
+-- users.search_text 列と isureal_search_text 関数、その関連インデックスは migrate.sql で追加する
+CREATE INDEX users_username_id ON users(username, id);
+CREATE INDEX login_sessions_token_hash_active ON login_sessions(token_hash) WHERE active = true;
+CREATE INDEX login_sessions_user_id_active ON login_sessions(user_id) WHERE active = true;
+CREATE INDEX administrator_sessions_token_hash_active ON administrator_sessions(token_hash) WHERE active = true;
+CREATE INDEX friendships_user_high_id ON friendships(user_high_id);
+CREATE INDEX follows_followee_id ON follows(followee_id);
+CREATE INDEX block_relations_blocked_id ON block_relations(blocked_id);
+CREATE INDEX friend_requests_requester_pending ON friend_requests(requester_id, recipient_id) WHERE status = 'pending';
+CREATE INDEX friend_requests_recipient_pending ON friend_requests(recipient_id, requester_id) WHERE status = 'pending';
+CREATE INDEX posts_author_id_posting_window_id ON posts(author_id, posting_window_id);
+CREATE INDEX posts_image_id ON posts(image_id);
+CREATE INDEX realmojis_image_id ON realmojis(image_id);
+CREATE INDEX comments_post_id_created_at ON comments(post_id, created_at, id) WHERE deleted_at IS NULL;
+CREATE INDEX notifications_user_id_created_at ON notifications(user_id, created_at, id);

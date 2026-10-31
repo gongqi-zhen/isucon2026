@@ -101,8 +101,8 @@ func registerHandler(h *HandlerContext) echo.HandlerFunc {
 			return NewAPIError(http.StatusConflict, "username_taken")
 		}
 		userID := uuid.NewString()
-		if _, err := tx.ExecContext(ctx, `INSERT INTO users (id, username, secret_key_hash, display_name, region) VALUES ($1, $2, $3, $4, $5)`,
-			userID, input.Username, hex.EncodeToString(hash[:]), input.DisplayName, input.Region); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO users (id, username, secret_key_hash, display_name, region, search_text) VALUES ($1, $2, $3, $4, $5, $6)`,
+			userID, input.Username, hex.EncodeToString(hash[:]), input.DisplayName, input.Region, userSearchText(input.Username, input.DisplayName)); err != nil {
 			return err
 		}
 		user, err := getUser(ctx, tx, userID)
@@ -208,7 +208,12 @@ func updateMeHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		defer tx.Rollback()
 		if input.DisplayName != nil {
-			if _, err := tx.ExecContext(ctx, `UPDATE users SET display_name = $2, updated_at = clock_timestamp() WHERE id = $1`, session.UserID, *input.DisplayName); err != nil {
+			// username は登録時の検証で正規化済みの形をしているので、そのまま使える。そうでなければ NULL にして検索時に Go で判定する。
+			if _, err := tx.ExecContext(ctx, `
+    UPDATE users SET display_name = $2, updated_at = clock_timestamp(),
+      search_text = CASE WHEN username ~ '^[a-z0-9_.-]+$' THEN username || E'\n' || $3 END
+    WHERE id = $1
+   `, session.UserID, *input.DisplayName, normalizeSearchText(*input.DisplayName)); err != nil {
 				return err
 			}
 		}
