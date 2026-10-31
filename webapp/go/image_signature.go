@@ -41,7 +41,12 @@ func imageSignature(key []byte, imageID string, exp int64) []byte {
 	return value
 }
 
+// user は画像の所有者であること（投稿は作者、RealMoji はリアクションした人、プロフィール画像は本人）。
+// 署名に使う所有者の鍵をここで覚えておき、画像の取得時に所有者を DB に問い合わせる往復を省く。
 func signedImageURL(user User, imageID string) string {
+	if _, ok := imageOwnerKeyCache.Get(imageID); !ok && user.SecretKeyHash != "" {
+		imageOwnerKeyCache.Add(imageID, user.SecretKeyHash, 1, time.Time{})
+	}
 	exp := time.Now().Add(imageURLLifetime).Unix()
 	exp -= exp % imageURLExpGranularity
 	cacheKey := string(user.ImageKey) + "\x00" + imageID
