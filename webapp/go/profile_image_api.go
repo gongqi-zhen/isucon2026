@@ -7,6 +7,7 @@ import (
 	"image/jpeg"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v5"
@@ -56,9 +57,11 @@ func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 				return err
 			}
 		}
+		validatedAt := time.Now()
 		if err := tx.Commit(); err != nil {
 			return err
 		}
+		cacheUploadedImage(imageID, data, validatedAt)
 		return c.NoContent(http.StatusNoContent)
 	}
 }

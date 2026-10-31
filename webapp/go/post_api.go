@@ -146,9 +146,11 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
+		validatedAt := time.Now()
 		if err := tx.Commit(); err != nil {
 			return err
 		}
+		cacheUploadedImage(imageID, imageData, validatedAt)
 		return c.JSON(http.StatusCreated, newPostResponse(post, user))
 	}
 }

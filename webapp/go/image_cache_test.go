@@ -3,6 +3,7 @@ package isureal
 import (
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"net/url"
 	"strconv"
 	"strings"
@@ -117,5 +118,47 @@ func TestSignedImageURLIsVerifiableAndCached(t *testing.T) {
 	other := sha256.Sum256([]byte("other"))
 	if signedImageURL(User{ImageKey: other[:]}, "image-1") == first {
 		t.Fatal("different keys must not share a cached signature")
+	}
+}
+
+func TestSignedImageURLRemembersOwnerKey(t *testing.T) {
+	resetImageCaches()
+	t.Cleanup(resetImageCaches)
+	hash := sha256.Sum256([]byte("owner-secret"))
+	user := User{SecretKeyHash: hex.EncodeToString(hash[:])}
+	if err := user.setImageKey(); err != nil {
+		t.Fatal(err)
+	}
+	signedImageURL(user, "image-1")
+	got, ok := imageOwnerKeyCache.Get("image-1")
+	if !ok || got != user.SecretKeyHash {
+		t.Fatalf("owner key = %q, %v", got, ok)
+	}
+
+	// 鍵が無いユーザー（ゼロ値）では覚えない。
+	signedImageURL(User{}, "image-2")
+	if _, ok := imageOwnerKeyCache.Get("image-2"); ok {
+		t.Fatal("empty secret_key_hash should not be cached")
+	}
+}
+
+func TestCacheUploadedImageValidityStartsBeforeCommit(t *testing.T) {
+	resetImageCaches()
+	t.Cleanup(resetImageCaches)
+	validatedAt := time.Now().Add(-imageValidityTTL - time.Millisecond)
+	cacheUploadedImage("old", []byte{1, 2, 3}, validatedAt)
+	if _, ok := imageObjectCache.Get("old"); !ok {
+		t.Fatal("image data should be cached")
+	}
+	// 有効期限は validatedAt から数えるので、それより古い確認結果は使わない。
+	if _, ok := imageValidityCache.Get("old"); ok {
+		t.Fatal("validity must expire imageValidityTTL after validatedAt")
+	}
+	cacheUploadedImage("new", []byte{4}, time.Now())
+	if obj, ok := imageObjectCache.Get("new"); !ok || obj.MediaType != "image/jpeg" || len(obj.Data) != 1 {
+		t.Fatalf("cached object = %+v, %v", obj, ok)
+	}
+	if _, ok := imageValidityCache.Get("new"); !ok {
+		t.Fatal("fresh upload should be cached as valid")
 	}
 }

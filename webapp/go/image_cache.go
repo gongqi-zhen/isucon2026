@@ -105,6 +105,14 @@ var (
 	imageValidityCache = newLRUCache[string, struct{}](500_000)
 )
 
+// アップロードを受け付けたプロセスで、確定した画像をそのままキャッシュに入れる。投稿直後の取得で DB を引かずに済む。
+// COMMIT が成功した後に呼ぶこと。validatedAt は COMMIT の前に取った時刻にする。
+// COMMIT の時点で画像は有効なので、そこから imageValidityTTL の間は有効とみなしても、削除の反映は TTL を超えて遅れない。
+func cacheUploadedImage(imageID string, data []byte, validatedAt time.Time) {
+	imageObjectCache.Add(imageID, cachedImageObject{Data: data, MediaType: "image/jpeg"}, int64(len(data)), time.Time{})
+	imageValidityCache.Add(imageID, struct{}{}, 1, validatedAt.Add(imageValidityTTL))
+}
+
 func resetImageCaches() {
 	signedURLCache.Reset()
 	verifiedSignatureCache.Reset()
