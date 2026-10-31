@@ -44,7 +44,8 @@ func openPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		defer tx.Rollback()
 		// 同じリージョンの投稿期間の開始を直列にする。users のテーブルロックは登録やプロフィール更新まで止めてしまうので使わない。
-		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext('posting_window:' || $1))`, region); err != nil {
+		// 同じ文で pg_notify を送り、各プロセスの通知ハブにすぐ確認させる（#60）。届くのは COMMIT の後だけで、ロールバックすれば届かない。
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext('posting_window:' || $1)), pg_notify($2, $1)`, region, postingWindowNotifyChannel); err != nil {
 			return err
 		}
 		var conflict bool
