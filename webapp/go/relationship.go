@@ -2,65 +2,65 @@ package isureal
 
 import (
 	"context"
-	"database/sql"
+	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/jmoiron/sqlx"
 )
 
-type FriendRequest struct {
-	ID          string    `db:"id"`
-	RequesterID string    `db:"requester_id"`
-	RecipientID string    `db:"recipient_id"`
-	Status      string    `db:"status"`
-	CreatedAt   time.Time `db:"created_at"`
-	UpdatedAt   time.Time `db:"updated_at"`
-}
-
-func getFriendRequest(ctx context.Context, db sqlx.QueryerContext, id string) (FriendRequest, error) {
-	var request FriendRequest
-	err := sqlx.GetContext(ctx, db, &request, `SELECT id, requester_id, recipient_id, status, created_at, updated_at FROM friend_requests WHERE id=$1`, id)
-	return request, err
-}
-
-func beginRelationshipTx(ctx context.Context, db *sqlx.DB, actor, target string) (*sqlx.Tx, error) {
+// relationshipTarget は、友達関係の操作の相手として不正な値（自分自身や空）を 400 にする。
+func relationshipTarget(actor, target string) error {
 	if actor == target || target == "" {
-		return nil, NewAPIError(http.StatusBadRequest, "invalid_relationship")
+		return NewAPIError(http.StatusBadRequest, "invalid_relationship")
 	}
-	tx, err := db.BeginTxx(ctx, nil)
-	if err != nil {
-		return nil, err
+	return nil
+}
+
+// relationshipOutcome は、migrate.sql の isureal_* 関数が返す結果を API のエラーに変換する。
+func relationshipOutcome(result string) error {
+	switch result {
+	case "ok":
+		return nil
+	case "not_found":
+		return NewAPIError(http.StatusNotFound, "relationship_not_found")
+	case "conflict":
+		return NewAPIError(http.StatusConflict, "relationship_conflict")
+	case "forbidden":
+		return NewAPIError(http.StatusForbidden, "relationship_action_forbidden")
+	default:
+		return fmt.Errorf("unexpected relationship result: %q", result)
 	}
-	// 2人を Go の文字列比較と同じ順（COLLATE "C"）で1回のクエリでロックする。
-	var lockedIDs []string
-	if err := tx.SelectContext(ctx, &lockedIDs, `SELECT id FROM users WHERE id IN ($1, $2) AND status='active' ORDER BY id COLLATE "C" FOR NO KEY UPDATE`, actor, target); err != nil {
-		tx.Rollback()
-		return nil, err
+}
+
+// callRelationshipFunc は、ロックの取得から確定までを DB の中で行う関数を autocommit の1文で呼ぶ（#33 案A）。
+// users 行のロックを持つのは関数の実行中だけになる。
+func callRelationshipFunc(ctx context.Context, db sqlx.QueryerContext, query string, args ...any) error {
+	var result string
+	if err := sqlx.GetContext(ctx, db, &result, query, args...); err != nil {
+		return err
 	}
-	if len(lockedIDs) != 2 {
-		tx.Rollback()
-		return nil, NewAPIError(http.StatusNotFound, "relationship_not_found")
+	return relationshipOutcome(result)
+}
+
+// friendRequestResult は、友達申請の関数が返す行。
+type friendRequestResult struct {
+	Result    string     `db:"out_result"`
+	ID        *string    `db:"out_id"`
+	Status    *string    `db:"out_status"`
+	UpdatedAt *time.Time `db:"out_updated_at"`
+}
+
+func callFriendRequestFunc(ctx context.Context, db sqlx.QueryerContext, query string, args ...any) (friendRequestResult, error) {
+	var result friendRequestResult
+	if err := sqlx.GetContext(ctx, db, &result, query, args...); err != nil {
+		return result, err
 	}
-	return tx, nil
+	return result, relationshipOutcome(result.Result)
 }
 
 func isBlocked(ctx context.Context, db sqlx.QueryerContext, actor, target string) (bool, error) {
 	var blocked bool
 	err := sqlx.GetContext(ctx, db, &blocked, `SELECT EXISTS(SELECT 1 FROM block_relations WHERE (blocker_id=$1 AND blocked_id=$2) OR (blocker_id=$2 AND blocked_id=$1))`, actor, target)
 	return blocked, err
-}
-
-func requireRelationshipChange(result sql.Result, err error, status int, code string) error {
-	if err != nil {
-		return err
-	}
-	count, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if count == 0 {
-		return NewAPIError(status, code)
-	}
-	return nil
 }
