@@ -35,9 +35,12 @@ for i in $(seq 1 24); do date +%T; curl -s 127.0.0.1:6060/debug/vars | jq -c '{d
 
 ### DB の接続数（`ISUREAL_DB_MAX_CONNS`）
 - 走行の前後で `isureal_db.WaitCount` が増えていれば、接続が足りずに待っています。`WaitDuration` の増分 ÷ `WaitCount` の増分が、1回あたりの待ちです。
-- 今の設定は asia1 = 40、europe1 = america1 = 32（各サーバの `~/env.sh`。合計 104。#125 で asia1 = 24、europe1 = america1 = 40 から変えた）。asia1 はリクエストが europe1 の 12〜15 倍（#35）です。
+- 今の設定は asia1 = 24、europe1 = america1 = 40（各サーバの `~/env.sh`。合計 104）。asia1 はリクエストが europe1 の 12〜15 倍（#35）です。
 - asia1 で待ちが出ていれば、合計を増やさずに配分を変えます（例：asia1 = 40、europe1 = america1 = 32）。PostgreSQL の接続1本は約 12MB で、asia2 は OOM を起こしたことがあります（#16 のコメント）。全台の合計が `max_connections = 256` と asia2 のメモリに収まることを、asia2 の `free -m` で確かめます。
 - europe1 と america1 で `WaitCount` が 0 のままなら、その分を asia1 に回せます。
+- #125 で asia1 = 40、europe1 = america1 = 32 を試した結果（2026-10-31、走行1回ずつ）：3台の待ちの合計（`WaitDuration` の増分）は 7,052秒 から 4,237秒 に減ったが、スコアは 62,370 から 53,947 に下がったので、元に戻した。
+  - 待ちが減っても、スコアが上がるとは限りません。ピークのとき asia2 の CPU は空きが 0% で、asia1 の同時実行が増えると、PostgreSQL のロック待ちが増えます。europe1 の1回あたりの待ちは 98ms から 149ms に増えました。
+  - 配分を変えたら、待ちの値だけでなく、必ずスコアで比べます。
 
 ### 画像本体のキャッシュ（`ISUREAL_IMAGE_CACHE_BYTES`、既定 512MB）
 - `image_object.evictions` が走行の間に増え続けていれば、上限に当たっています。`misses` のうち追い出しが原因の分は、DB からリージョンをまたいで読み直しています（1枚 約450KB）。
