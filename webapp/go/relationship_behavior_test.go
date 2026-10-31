@@ -250,3 +250,37 @@ func TestRelationshipConcurrent(t *testing.T) {
 		}
 	}
 }
+
+// 退会した相手との操作は、ロックを取れないので 404 になる（#33 案A で DB の関数に移した分岐）。
+func TestRelationshipDeletedUserBehavior(t *testing.T) {
+	env := newLockTestEnv(t)
+	a, b, gone := env.user("asia"), env.user("asia"), env.user("asia")
+
+	// a から gone への申請と、b から a への申請を作ってから gone を退会させる
+	status, body := env.do("POST", "/api/friend-requests", a.token, map[string]string{"recipientId": gone.id}, nil)
+	expectStatus(t, "a->gone", status, http.StatusCreated, body)
+	toGone := body["relationId"].(string)
+	status, body = env.do("POST", "/api/me/account-deletion", gone.token, nil, nil)
+	expectStatus(t, "gone deletes account", status, http.StatusNoContent, body)
+
+	status, body = env.do("POST", "/api/friend-requests", b.token, map[string]string{"recipientId": gone.id}, nil)
+	expectError(t, "request to deleted", status, http.StatusNotFound, body, "relationship_not_found")
+	status, body = env.do("POST", "/api/friend-requests/"+toGone+"/cancel", a.token, nil, nil)
+	expectError(t, "cancel request to deleted", status, http.StatusNotFound, body, "relationship_not_found")
+	if env.requestStatus(toGone) != "pending" {
+		t.Fatal("request to deleted user should stay pending")
+	}
+	// 権限の確認はロックの前に行うので、権限がなければ退会済みでも 403
+	status, body = env.do("POST", "/api/friend-requests/"+toGone+"/accept", a.token, nil, nil)
+	expectError(t, "accept own request to deleted", status, http.StatusForbidden, body, "relationship_action_forbidden")
+	for _, op := range []struct{ name, method, path string }{
+		{"follow deleted", "PUT", "/api/follows/"},
+		{"unfollow deleted", "DELETE", "/api/follows/"},
+		{"block deleted", "PUT", "/api/blocks/"},
+		{"unblock deleted", "DELETE", "/api/blocks/"},
+		{"unfriend deleted", "DELETE", "/api/friendships/"},
+	} {
+		status, body = env.do(op.method, op.path+gone.id, b.token, nil, nil)
+		expectError(t, op.name, status, http.StatusNotFound, body, "relationship_not_found")
+	}
+}

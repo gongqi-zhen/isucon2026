@@ -69,3 +69,198 @@ CREATE INDEX IF NOT EXISTS posts_created_at ON posts(created_at);
 ALTER TABLE notifications DROP CONSTRAINT IF EXISTS notifications_user_id_fkey;
 ALTER TABLE notifications DROP CONSTRAINT IF EXISTS notifications_posting_window_id_fkey;
 ALTER TABLE notifications DROP CONSTRAINT IF EXISTS notifications_user_id_posting_window_id_key;
+
+-- 友達関係の操作を、ロックの取得から確定までを DB の中で行う関数にする（#33 案A）。
+-- アプリは autocommit の1文で呼ぶので、users 行のロックを持つのは関数の実行中だけになり、
+-- europe・america からの往復（約100ms）の間ロックを持ち続けることがなくなる。
+-- 結果は 'ok'、'not_found'（404 relationship_not_found）、'conflict'（409 relationship_conflict）、
+-- 'forbidden'（403 relationship_action_forbidden）のいずれかで返す。
+-- 関数の中の文はそれぞれ新しいスナップショットで動くので、ロックの後の確認はロック後の状態を見る。
+
+-- 2人の users 行を、Go の文字列比較と同じ順（COLLATE "C"）で FOR NO KEY UPDATE ロックする。
+-- 2人とも active ならロックして true を返す。
+CREATE OR REPLACE FUNCTION isureal_lock_user_pair(a text, b text) RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+  n int;
+BEGIN
+  SELECT count(*) INTO n FROM (
+    SELECT u.id FROM users u WHERE u.id IN (a, b) AND u.status = 'active' ORDER BY u.id COLLATE "C" FOR NO KEY UPDATE
+  ) locked;
+  RETURN n = 2;
+END $$;
+
+CREATE OR REPLACE FUNCTION isureal_is_blocked(a text, b text) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+  SELECT EXISTS(SELECT 1 FROM block_relations br WHERE (br.blocker_id = a AND br.blocked_id = b) OR (br.blocker_id = b AND br.blocked_id = a))
+$$;
+
+-- 友達申請。ブロック関係か友達関係があれば conflict。
+-- 相手からの pending の申請があれば、それを承認して友達関係を作る。自分からの pending の申請があれば conflict。
+-- どちらもなければ、新しい申請を作る。
+CREATE OR REPLACE FUNCTION isureal_create_friend_request(actor text, recipient text, new_request_id text, new_friendship_id text, low_id text, high_id text)
+RETURNS TABLE(out_result text, out_id text, out_status text, out_updated_at timestamptz)
+LANGUAGE plpgsql AS $$
+DECLARE
+  p friend_requests%ROWTYPE;
+BEGIN
+  IF NOT isureal_lock_user_pair(actor, recipient) THEN
+    RETURN QUERY SELECT 'not_found'::text, NULL::text, NULL::text, NULL::timestamptz;
+    RETURN;
+  END IF;
+  IF isureal_is_blocked(actor, recipient)
+     OR EXISTS(SELECT 1 FROM friendships f WHERE (f.user_low_id = actor AND f.user_high_id = recipient) OR (f.user_low_id = recipient AND f.user_high_id = actor)) THEN
+    RETURN QUERY SELECT 'conflict'::text, NULL::text, NULL::text, NULL::timestamptz;
+    RETURN;
+  END IF;
+  SELECT * INTO p FROM friend_requests fr WHERE fr.status = 'pending'
+    AND ((fr.requester_id = actor AND fr.recipient_id = recipient) OR (fr.requester_id = recipient AND fr.recipient_id = actor))
+    LIMIT 1;
+  IF FOUND THEN
+    IF p.requester_id <> recipient THEN
+      RETURN QUERY SELECT 'conflict'::text, NULL::text, NULL::text, NULL::timestamptz;
+      RETURN;
+    END IF;
+    RETURN QUERY
+      WITH accepted AS (
+        UPDATE friend_requests fr SET status = 'accepted', updated_at = clock_timestamp()
+        WHERE fr.id = p.id
+        RETURNING fr.id, fr.status, fr.updated_at
+      ), friendship AS (
+        INSERT INTO friendships (id, user_low_id, user_high_id, source_request_id)
+        SELECT new_friendship_id, low_id, high_id, accepted.id FROM accepted
+      )
+      SELECT 'ok'::text, accepted.id::text, accepted.status, accepted.updated_at FROM accepted;
+    RETURN;
+  END IF;
+  RETURN QUERY
+    INSERT INTO friend_requests (id, requester_id, recipient_id, status, created_at, updated_at)
+    VALUES (new_request_id, actor, recipient, 'pending', clock_timestamp(), clock_timestamp())
+    RETURNING 'ok'::text, friend_requests.id::text, friend_requests.status, friend_requests.updated_at;
+END $$;
+
+-- 友達申請の承認・拒否・取り下げ。申請がなければ not_found、操作する権限がなければ forbidden。
+-- ロックの後、pending でなければ forbidden、承認でブロック関係があれば conflict。
+CREATE OR REPLACE FUNCTION isureal_transition_friend_request(actor text, request_id text, new_status text, new_friendship_id text)
+RETURNS TABLE(out_result text, out_id text, out_status text, out_updated_at timestamptz)
+LANGUAGE plpgsql AS $$
+DECLARE
+  r friend_requests%ROWTYPE;
+  current_status text;
+BEGIN
+  SELECT * INTO r FROM friend_requests fr WHERE fr.id = request_id;
+  IF NOT FOUND THEN
+    RETURN QUERY SELECT 'not_found'::text, NULL::text, NULL::text, NULL::timestamptz;
+    RETURN;
+  END IF;
+  IF (new_status = 'cancelled' AND actor <> r.requester_id) OR (new_status <> 'cancelled' AND actor <> r.recipient_id) THEN
+    RETURN QUERY SELECT 'forbidden'::text, NULL::text, NULL::text, NULL::timestamptz;
+    RETURN;
+  END IF;
+  IF NOT isureal_lock_user_pair(r.requester_id, r.recipient_id) THEN
+    RETURN QUERY SELECT 'not_found'::text, NULL::text, NULL::text, NULL::timestamptz;
+    RETURN;
+  END IF;
+  -- 申請者と受信者は変わらないので、状態だけを読み直す
+  SELECT fr.status INTO current_status FROM friend_requests fr WHERE fr.id = request_id;
+  IF current_status <> 'pending' THEN
+    RETURN QUERY SELECT 'forbidden'::text, NULL::text, NULL::text, NULL::timestamptz;
+    RETURN;
+  END IF;
+  IF new_status = 'accepted' THEN
+    IF isureal_is_blocked(r.requester_id, r.recipient_id) THEN
+      RETURN QUERY SELECT 'conflict'::text, NULL::text, NULL::text, NULL::timestamptz;
+      RETURN;
+    END IF;
+    INSERT INTO friendships (id, user_low_id, user_high_id, source_request_id)
+    VALUES (new_friendship_id,
+            CASE WHEN r.requester_id COLLATE "C" < r.recipient_id COLLATE "C" THEN r.requester_id ELSE r.recipient_id END,
+            CASE WHEN r.requester_id COLLATE "C" < r.recipient_id COLLATE "C" THEN r.recipient_id ELSE r.requester_id END,
+            r.id);
+  END IF;
+  RETURN QUERY
+    UPDATE friend_requests fr SET status = new_status, updated_at = clock_timestamp()
+    WHERE fr.id = request_id
+    RETURNING 'ok'::text, fr.id::text, fr.status, fr.updated_at;
+END $$;
+
+-- 友達の解除。友達でなければ conflict。
+CREATE OR REPLACE FUNCTION isureal_delete_friendship(actor text, target text, low_id text, high_id text) RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NOT isureal_lock_user_pair(actor, target) THEN
+    RETURN 'not_found';
+  END IF;
+  DELETE FROM friendships f WHERE f.user_low_id = low_id AND f.user_high_id = high_id;
+  IF NOT FOUND THEN
+    RETURN 'conflict';
+  END IF;
+  RETURN 'ok';
+END $$;
+
+-- フォロー。相手が認定公開アカウントでない、ブロック関係がある、すでにフォローしている場合は conflict。
+CREATE OR REPLACE FUNCTION isureal_follow(actor text, target text, new_follow_id text) RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NOT isureal_lock_user_pair(actor, target) THEN
+    RETURN 'not_found';
+  END IF;
+  INSERT INTO follows (id, follower_id, followee_id)
+  SELECT new_follow_id, actor, target FROM users u
+  WHERE u.id = target AND u.status = 'active' AND u.account_type = 'certified_public'
+    AND NOT isureal_is_blocked(actor, target)
+    AND NOT EXISTS(SELECT 1 FROM follows fo WHERE fo.follower_id = actor AND fo.followee_id = target);
+  IF NOT FOUND THEN
+    RETURN 'conflict';
+  END IF;
+  RETURN 'ok';
+END $$;
+
+-- フォローの解除。フォローしていなければ conflict。
+CREATE OR REPLACE FUNCTION isureal_unfollow(actor text, target text) RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NOT isureal_lock_user_pair(actor, target) THEN
+    RETURN 'not_found';
+  END IF;
+  DELETE FROM follows fo WHERE fo.follower_id = actor AND fo.followee_id = target;
+  IF NOT FOUND THEN
+    RETURN 'conflict';
+  END IF;
+  RETURN 'ok';
+END $$;
+
+-- ブロック。すでにブロックしていれば conflict。
+-- 新しくブロックしたときだけ、友達関係・双方向のフォロー・pending の申請を後始末する。
+CREATE OR REPLACE FUNCTION isureal_block(actor text, target text, new_block_id text, low_id text, high_id text) RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NOT isureal_lock_user_pair(actor, target) THEN
+    RETURN 'not_found';
+  END IF;
+  INSERT INTO block_relations (id, blocker_id, blocked_id)
+  SELECT new_block_id, actor, target
+  WHERE NOT EXISTS(SELECT 1 FROM block_relations br WHERE br.blocker_id = actor AND br.blocked_id = target);
+  IF NOT FOUND THEN
+    RETURN 'conflict';
+  END IF;
+  DELETE FROM friendships f WHERE f.user_low_id = low_id AND f.user_high_id = high_id;
+  DELETE FROM follows fo WHERE (fo.follower_id = actor AND fo.followee_id = target) OR (fo.follower_id = target AND fo.followee_id = actor);
+  UPDATE friend_requests fr SET status = 'cancelled', updated_at = clock_timestamp()
+  WHERE fr.status = 'pending' AND ((fr.requester_id = actor AND fr.recipient_id = target) OR (fr.requester_id = target AND fr.recipient_id = actor));
+  RETURN 'ok';
+END $$;
+
+-- ブロックの解除。ブロックしていなければ forbidden。
+CREATE OR REPLACE FUNCTION isureal_unblock(actor text, target text) RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NOT isureal_lock_user_pair(actor, target) THEN
+    RETURN 'not_found';
+  END IF;
+  DELETE FROM block_relations br WHERE br.blocker_id = actor AND br.blocked_id = target;
+  IF NOT FOUND THEN
+    RETURN 'forbidden';
+  END IF;
+  RETURN 'ok';
+END $$;
