@@ -133,13 +133,19 @@ func CreateLoginSession(db *sqlx.DB, userID string) (*Session, error) {
 	return session, nil
 }
 
+// newLoginSessionToken は、新しいセッションのトークンと、DB に保存するそのハッシュを返す。
+func newLoginSessionToken() (token, tokenHash string) {
+	token = uuid.NewString()
+	hash := sha256.Sum256([]byte(token))
+	return token, hex.EncodeToString(hash[:])
+}
+
 // createLoginSessionTx は呼び出し元が users の行を FOR NO KEY UPDATE でロックし、active であることを確かめた後に呼ぶ。
 // europe と america から DB への1往復は約100ms なので、既存セッションの無効化と新しいセッションの追加を1つの文で行う。
 // CTE の UPDATE は本体の INSERT と同じスナップショットで動くので、追加した行は無効化されない。
+// ログイン（loginHandler）は、同じ処理を DB の関数 isureal_login（migrate.sql）で行う（#67）。
 func createLoginSessionTx(ctx context.Context, tx *sqlx.Tx, userID string) (*Session, error) {
-	randomToken := uuid.NewString()
-	tokenHashBytes := sha256.Sum256([]byte(randomToken))
-	tokenHash := hex.EncodeToString(tokenHashBytes[:])
+	randomToken, tokenHash := newLoginSessionToken()
 	sessionID := uuid.NewString()
 	var session Session
 	if err := tx.GetContext(ctx, &session, `

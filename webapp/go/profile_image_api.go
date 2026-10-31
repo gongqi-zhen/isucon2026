@@ -2,8 +2,7 @@ package isureal
 
 import (
 	"bytes"
-	"database/sql"
-	"errors"
+	"fmt"
 	"image/jpeg"
 	"io"
 	"net/http"
@@ -33,32 +32,15 @@ func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 
 		ctx := c.Request().Context()
 		userID := GetSession(c).UserID
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-		var oldID *string
-		if err := tx.GetContext(ctx, &oldID, `SELECT profile_image_id FROM users WHERE id=$1 FOR NO KEY UPDATE`, userID); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return NewAPIError(http.StatusNotFound, "account_not_found")
-			}
-			return err
-		}
+		// 本人の行のロック、画像の追加、profile_image_id の更新、前の画像の削除を、DB の関数1回の呼び出しで行う（#67）。
+		// アップロードした画像の有効期限は、確定より前に取った時刻から数える。
 		imageID := uuid.NewString()
-		if _, err := tx.ExecContext(ctx, `INSERT INTO image_objects(id,owner_user_id,data,media_type) VALUES ($1,$2,$3,'image/jpeg')`, imageID, userID, data); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE users SET profile_image_id=$2,updated_at=clock_timestamp() WHERE id=$1`, userID, imageID); err != nil {
-			return err
-		}
-		if oldID != nil {
-			if _, err := tx.ExecContext(ctx, `DELETE FROM image_objects WHERE id=$1`, *oldID); err != nil {
-				return err
-			}
-		}
 		validatedAt := time.Now()
-		if err := tx.Commit(); err != nil {
+		var result string
+		if err := h.DB.GetContext(ctx, &result, `SELECT isureal_put_profile_image($1, $2, $3)`, userID, imageID, data); err != nil {
+			return err
+		}
+		if err := accountOutcome(result); err != nil {
 			return err
 		}
 		cacheUploadedImage(imageID, data, validatedAt)
@@ -68,33 +50,27 @@ func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 
 func deleteProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
-		ctx := c.Request().Context()
-		userID := GetSession(c).UserID
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
+		// 本人の行のロック、profile_image_id を NULL にする更新、画像の削除を、DB の関数1回の呼び出しで行う（#67）。
+		var result string
+		if err := h.DB.GetContext(c.Request().Context(), &result, `SELECT isureal_delete_profile_image($1)`, GetSession(c).UserID); err != nil {
 			return err
 		}
-		defer tx.Rollback()
-		var imageID *string
-		err = tx.GetContext(ctx, &imageID, `SELECT profile_image_id FROM users WHERE id=$1 FOR NO KEY UPDATE`, userID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return NewAPIError(http.StatusNotFound, "account_not_found")
-		}
-		if err != nil {
-			return err
-		}
-		if imageID == nil {
-			return NewAPIError(http.StatusNotFound, "account_not_found")
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE users SET profile_image_id=NULL,updated_at=clock_timestamp() WHERE id=$1`, userID); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM image_objects WHERE id=$1`, *imageID); err != nil {
-			return err
-		}
-		if err := tx.Commit(); err != nil {
+		if err := accountOutcome(result); err != nil {
 			return err
 		}
 		return c.NoContent(http.StatusNoContent)
+	}
+}
+
+// accountOutcome は、プロフィール画像と退会の関数（migrate.sql）が返す結果を API のエラーに変換する。
+// not_found は、変更前に行が見つからなかった場合（プロフィール画像の削除では、画像が設定されていない場合も）と同じく 404 にする。
+func accountOutcome(result string) error {
+	switch result {
+	case "ok":
+		return nil
+	case "not_found":
+		return NewAPIError(http.StatusNotFound, "account_not_found")
+	default:
+		return fmt.Errorf("unexpected account result: %q", result)
 	}
 }

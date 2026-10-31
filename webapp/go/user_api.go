@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v5"
@@ -83,33 +85,16 @@ func registerHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		secretKey := uuid.NewString()
 		hash := sha256.Sum256([]byte(secretKey))
-		ctx := c.Request().Context()
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-		// ユーザー名は一意。同時に同じユーザー名で登録された場合は、users_username_key の一意制約違反で 409 にする。
-		var exists bool
-		if err := tx.GetContext(ctx, &exists, `SELECT EXISTS(SELECT 1 FROM users WHERE username = $1)`, input.Username); err != nil {
-			return err
-		}
-		if exists {
-			return NewAPIError(http.StatusConflict, "username_taken")
-		}
-		userID := uuid.NewString()
-		if _, err := tx.ExecContext(ctx, `INSERT INTO users (id, username, secret_key_hash, display_name, region, search_text) VALUES ($1, $2, $3, $4, $5, $6)`,
-			userID, input.Username, hex.EncodeToString(hash[:]), input.DisplayName, input.Region, userSearchText(input.Username, input.DisplayName)); err != nil {
+		// ユーザー名は一意。すでにあるユーザー名（同時の登録も含む）は、users_username_key の一意制約違反で 409 にする。
+		// 確認と追加と読み直しを、autocommit の1文で行う（#67）。
+		var user User
+		if err := h.DB.GetContext(c.Request().Context(), &user, `
+   INSERT INTO users (id, username, secret_key_hash, display_name, region, search_text) VALUES ($1, $2, $3, $4, $5, $6)
+   RETURNING `+strings.Join(userColumns, ", "),
+			uuid.NewString(), input.Username, hex.EncodeToString(hash[:]), input.DisplayName, input.Region, userSearchText(input.Username, input.DisplayName)); err != nil {
 			if isUniqueViolation(err) {
 				return NewAPIError(http.StatusConflict, "username_taken")
 			}
-			return err
-		}
-		user, err := getUser(ctx, tx, userID)
-		if err != nil {
-			return err
-		}
-		if err := tx.Commit(); err != nil {
 			return err
 		}
 		return c.JSON(http.StatusCreated, registerResponse{SecretKey: secretKey, User: newSessionUserResponse(user)})
@@ -127,33 +112,30 @@ func loginHandler(h *HandlerContext) echo.HandlerFunc {
 			return NewAPIError(http.StatusUnauthorized, "invalid_credentials")
 		}
 		ctx := c.Request().Context()
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-		var user User
-		err = tx.GetContext(ctx, &user, `SELECT id, username, secret_key_hash, display_name, bio, profile_image_id, region, account_type, status FROM users WHERE username = $1 FOR NO KEY UPDATE`, input.Username)
-		if errors.Is(err, sql.ErrNoRows) {
-			return NewAPIError(http.StatusUnauthorized, "invalid_credentials")
-		}
-		if err != nil {
-			return err
-		}
 		hash := sha256.Sum256([]byte(input.SecretKey))
-		if user.Status != "active" || user.SecretKeyHash != hex.EncodeToString(hash[:]) {
+		token, tokenHash := newLoginSessionToken()
+		// 行のロック、active と SecretKey の確認、セッションの置き換えを、DB の関数1回の呼び出しで行う（#67）。
+		var row struct {
+			Result string `db:"out_result"`
+			funcUser
+		}
+		if err := h.DB.GetContext(ctx, &row, `
+   SELECT out_result, `+funcUserColumns+`
+   FROM isureal_login($1, $2, $3, $4)
+  `, input.Username, hex.EncodeToString(hash[:]), uuid.NewString(), tokenHash); err != nil {
+			return err
+		}
+		switch row.Result {
+		case "ok":
+		case "invalid_credentials":
 			return NewAPIError(http.StatusUnauthorized, "invalid_credentials")
+		default:
+			return fmt.Errorf("unexpected login result: %q", row.Result)
 		}
-		session, err := createLoginSessionTx(ctx, tx, user.ID)
-		if err != nil {
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			return err
-		}
+		user := row.user()
 		// 以前のセッションを置き換えたので、ほかのプロセスのキャッシュに反映されるまで待つ。
 		waitSessionInvalidation(ctx, user.Region, user.ID)
-		return c.JSON(http.StatusOK, loginResponse{Token: session.Token, User: newSessionUserResponse(user)})
+		return c.JSON(http.StatusOK, loginResponse{Token: token, User: newSessionUserResponse(user)})
 	}
 }
 
@@ -205,39 +187,33 @@ func updateMeHandler(h *HandlerContext) echo.HandlerFunc {
 			return NewAPIError(http.StatusBadRequest, "invalid_profile")
 		}
 		ctx := c.Request().Context()
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
+		var searchText *string
 		if input.DisplayName != nil {
-			// username は登録時の検証で正規化済みの形をしているので、そのまま使える。そうでなければ NULL にして検索時に Go で判定する。
-			if _, err := tx.ExecContext(ctx, `
-    UPDATE users SET display_name = $2, updated_at = clock_timestamp(),
-      search_text = CASE WHEN username ~ '^[a-z0-9_.-]+$' THEN username || E'\n' || $3 END
-    WHERE id = $1
-   `, session.UserID, *input.DisplayName, normalizeSearchText(*input.DisplayName)); err != nil {
-				return err
-			}
+			normalized := normalizeSearchText(*input.DisplayName)
+			searchText = &normalized
 		}
-		if input.Bio != nil {
-			if _, err := tx.ExecContext(ctx, `UPDATE users SET bio = $2, updated_at = clock_timestamp() WHERE id = $1`, session.UserID, *input.Bio); err != nil {
-				return err
-			}
-		}
-		if input.Region != nil {
-			if _, err := tx.ExecContext(ctx, `UPDATE users SET region = $2, updated_at = clock_timestamp() WHERE id = $1`, session.UserID, *input.Region); err != nil {
-				return err
-			}
-		}
-		user, err := getUser(ctx, tx, session.UserID)
+		// 指定された列だけを変え、変えた後の行を返す。autocommit の1文で行う（#67）。
+		// active でなければ0行になり、変更前と同じく 404 にする（変更前は更新してから getUser で確かめ、ロールバックしていた）。
+		// 表示名を変えるとき、username は登録時の検証で正規化済みの形をしているので、そのまま使える。そうでなければ NULL にして検索時に Go で判定する。
+		var user User
+		err := h.DB.GetContext(ctx, &user, `
+   UPDATE users SET
+     display_name = COALESCE($2::text, display_name),
+     search_text = CASE WHEN $2::text IS NULL THEN search_text
+                        WHEN username ~ '^[a-z0-9_.-]+$' THEN username || E'\n' || $3::text END,
+     bio = COALESCE($4::text, bio),
+     region = COALESCE($5::text, region),
+     updated_at = clock_timestamp()
+   WHERE id = $1 AND status = 'active'
+   RETURNING `+strings.Join(userColumns, ", "),
+			session.UserID, input.DisplayName, searchText, input.Bio, input.Region)
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewAPIError(http.StatusNotFound, "account_not_found")
 		}
 		if err != nil {
 			return err
 		}
-		if err := tx.Commit(); err != nil {
+		if err := user.setImageKey(); err != nil {
 			return err
 		}
 		if input.Region != nil && *input.Region != session.Region {
