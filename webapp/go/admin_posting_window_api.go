@@ -59,16 +59,10 @@ func openPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := tx.GetContext(ctx, &startsAt, `SELECT clock_timestamp()`); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE posting_windows SET ended_at = $2 WHERE region = $1 AND ended_at IS NULL`, region, startsAt); err != nil {
-			return err
-		}
+		// 前の投稿期間を終える UPDATE は、その行を COMMIT までロックし、そのリージョンの投稿（FOR SHARE）を待たせる。
+		// そこで、その行のロックが要らない通知の一括挿入を先に済ませ、UPDATE を COMMIT の直前に置く（#85）。
+		// 通知には外部キーがなく（#41）、COMMIT までは見えないので、新しい投稿期間より先に挿入してよい。
 		windowID := uuid.NewString()
-		if _, err := tx.ExecContext(ctx, `
-   INSERT INTO posting_windows (id, region, local_date, starts_at, on_time_deadline)
-   VALUES ($1, $2, $3, $4, $5)
-  `, windowID, region, localDate, startsAt, startsAt.Add(time.Duration(seconds)*time.Second)); err != nil {
-			return err
-		}
 		// ID は先頭48ビットに開始時刻（ミリ秒）を入れた UUID v7 にする。ランダムな UUID だと、主キーのインデックスの
 		// ばらばらのページに1行ずつ書き込むことになり、利用者の数だけページを読み書きする（#41）。
 		// 同じ文で挿入する行は先頭が同じになり、インデックスの近いページにまとまる。
@@ -82,8 +76,16 @@ func openPostingWindowHandler(h *HandlerContext) echo.HandlerFunc {
   `, region, windowID, startsAt); err != nil {
 			return err
 		}
-		window, err := getPostingWindow(ctx, tx, windowID)
-		if err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE posting_windows SET ended_at = $2 WHERE region = $1 AND ended_at IS NULL`, region, startsAt); err != nil {
+			return err
+		}
+		// 開いている投稿期間は1つだけ（posting_windows_one_active_region）なので、前の投稿期間を終えてから挿入する。
+		var window PostingWindow
+		if err := tx.GetContext(ctx, &window, `
+   INSERT INTO posting_windows (id, region, local_date, starts_at, on_time_deadline)
+   VALUES ($1, $2, $3, $4, $5)
+   RETURNING id, region, local_date, starts_at, on_time_deadline, ended_at
+  `, windowID, region, localDate, startsAt, startsAt.Add(time.Duration(seconds)*time.Second)); err != nil {
 			return err
 		}
 		if err := tx.Commit(); err != nil {
