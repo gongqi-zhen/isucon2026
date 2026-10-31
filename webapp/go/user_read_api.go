@@ -1,12 +1,13 @@
 package isureal
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"net/http"
-	"slices"
 	"strings"
 
+	"github.com/jmoiron/sqlx"
 	"github.com/labstack/echo/v5"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/unicode/norm"
@@ -135,31 +136,52 @@ func getUserHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := c.Bind(&input); err != nil {
 			return err
 		}
-		ctx := c.Request().Context()
-		viewer := GetSession(c).UserID
-		user, err := getUser(ctx, h.DB, input.UserID)
+		user, err := loadProfileUser(c.Request().Context(), h.DB, GetSession(c).UserID, input.UserID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewAPIError(http.StatusNotFound, "relationship_not_found")
 		}
 		if err != nil {
 			return err
 		}
-		blocked, err := isBlocked(ctx, h.DB, viewer, user.ID)
-		if err != nil {
-			return err
-		}
-		if blocked {
-			return NewAPIError(http.StatusNotFound, "relationship_not_found")
-		}
-		friends, err := getFriendIDs(ctx, h.DB, viewer)
-		if err != nil {
-			return err
-		}
-		if user.AccountType != "certified_public" && !slices.Contains(friends, user.ID) {
-			user.Bio = ""
-		}
 		return c.JSON(http.StatusOK, getUserResponse(newRelationshipUserResponse(user)))
 	}
+}
+
+// loadProfileUser は、viewerID から見た userID のプロフィールを、1回のクエリで読む（#65）。
+// 変更前は getUser、isBlocked、getFriendIDs の3往復だった。
+// 利用者が active でないか、どちらかの向きでブロックしていれば sql.ErrNoRows を返す。
+// 友達でも認定公開アカウントでもなければ、自己紹介を空にする。
+func loadProfileUser(ctx context.Context, db sqlx.QueryerContext, viewerID, userID string) (User, error) {
+	var row struct {
+		User
+		Blocked bool `db:"blocked"`
+		Friend  bool `db:"friend"`
+	}
+	if err := sqlx.GetContext(ctx, db, &row, `
+  SELECT `+qualifiedUserColumns("u")+`,
+    EXISTS(
+      SELECT 1 FROM block_relations b
+      WHERE (b.blocker_id = $1 AND b.blocked_id = u.id) OR (b.blocker_id = u.id AND b.blocked_id = $1)
+    ) AS blocked,
+    EXISTS(
+      SELECT 1 FROM friendships f
+      WHERE (f.user_low_id = $1 AND f.user_high_id = u.id) OR (f.user_high_id = $1 AND f.user_low_id = u.id)
+    ) AS friend
+  FROM users u WHERE u.id = $2 AND u.status = 'active'
+ `, viewerID, userID); err != nil {
+		return User{}, err
+	}
+	user := row.User
+	if err := user.setImageKey(); err != nil {
+		return user, err
+	}
+	if row.Blocked {
+		return User{}, sql.ErrNoRows
+	}
+	if user.AccountType != "certified_public" && !row.Friend {
+		user.Bio = ""
+	}
+	return user, nil
 }
 
 func newRelationshipUserResponse(user User) relationshipUserResponse {

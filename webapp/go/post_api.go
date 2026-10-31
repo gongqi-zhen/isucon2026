@@ -232,44 +232,53 @@ func updatePostHandler(h *HandlerContext) echo.HandlerFunc {
 				return NewAPIError(http.StatusBadRequest, "invalid_post")
 			}
 		}
-		ctx := c.Request().Context()
-		userID := GetSession(c).UserID
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
+		// 本人の行のロック、投稿の確認、更新、更新後の投稿の取得を、DB の関数1回の呼び出しで行う（#66）。
+		var row struct {
+			Result         string     `db:"out_result"`
+			ID             *string    `db:"out_id"`
+			AuthorID       *string    `db:"out_author_id"`
+			WindowID       *string    `db:"out_posting_window_id"`
+			ImageID        *string    `db:"out_image_id"`
+			Caption        *string    `db:"out_caption"`
+			Visibility     *string    `db:"out_visibility"`
+			LocationKind   *string    `db:"out_location_kind"`
+			Latitude       *float64   `db:"out_latitude"`
+			Longitude      *float64   `db:"out_longitude"`
+			Locality       *string    `db:"out_locality"`
+			PostedAt       *time.Time `db:"out_posted_at"`
+			OnTimeDeadline *time.Time `db:"out_on_time_deadline"`
+			WindowEndedAt  *time.Time `db:"out_window_ended_at"`
+			funcUser
+		}
+		if err := h.DB.GetContext(c.Request().Context(), &row, `
+   SELECT out_result, out_id, out_author_id, out_posting_window_id, out_image_id, out_caption, out_visibility,
+     out_location_kind, out_latitude, out_longitude, out_locality, out_posted_at, out_on_time_deadline, out_window_ended_at,
+     `+funcUserColumns+`
+   FROM isureal_update_post($1, $2, $3, $4)
+  `, GetSession(c).UserID, input.PostID, input.Caption, input.Visibility); err != nil {
 			return err
 		}
-		defer tx.Rollback()
-		lockedUser, err := lockUser(ctx, tx, userID)
-		if err != nil {
-			return err
-		}
-		post, err := getPost(ctx, tx, input.PostID)
-		if errors.Is(err, sql.ErrNoRows) {
+		switch row.Result {
+		case "ok":
+		case "not_found":
 			return NewAPIError(http.StatusNotFound, "post_not_found")
-		}
-		if err != nil {
-			return err
-		}
-		if post.AuthorID != userID {
+		case "forbidden":
 			return NewAPIError(http.StatusForbidden, "post_not_editable")
+		case "user_not_found":
+			// 変更前は、本人の行のロックか activeUser が sql.ErrNoRows になり 500 を返していた。
+			return sql.ErrNoRows
+		default:
+			return fmt.Errorf("unexpected update post result: %q", row.Result)
 		}
-		// getPost は投稿期間の ended_at も取得している。
-		if post.WindowEndedAt != nil {
-			return NewAPIError(http.StatusForbidden, "post_not_editable")
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE posts SET caption = COALESCE($2, caption), visibility = COALESCE($3, visibility) WHERE id = $1`, post.ID, input.Caption, input.Visibility); err != nil {
-			return err
-		}
-		post, err = getPost(ctx, tx, post.ID)
+		user, err := activeUser(row.user())
 		if err != nil {
 			return err
 		}
-		user, err := activeUser(lockedUser)
-		if err != nil {
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			return err
+		post := Post{
+			ID: *row.ID, AuthorID: *row.AuthorID, PostingWindowID: *row.WindowID, ImageID: *row.ImageID,
+			Caption: *row.Caption, Visibility: *row.Visibility,
+			PostLocation: PostLocation{Kind: *row.LocationKind, Latitude: row.Latitude, Longitude: row.Longitude, Locality: row.Locality},
+			PostedAt:     *row.PostedAt, OnTimeDeadline: *row.OnTimeDeadline, WindowEndedAt: row.WindowEndedAt,
 		}
 		return c.JSON(http.StatusOK, updatePostResponse(newPostResponse(post, user)))
 	}
@@ -285,43 +294,24 @@ func deletePostHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := c.Bind(&input); err != nil {
 			return err
 		}
-		ctx := c.Request().Context()
-		userID := GetSession(c).UserID
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
+		// 本人の行のロック、投稿の確認、その日の削除の回数の確認、削除を、DB の関数1回の呼び出しで行う（#66）。
+		var result string
+		if err := h.DB.GetContext(c.Request().Context(), &result, `SELECT isureal_delete_post($1, $2)`, GetSession(c).UserID, input.PostID); err != nil {
 			return err
 		}
-		defer tx.Rollback()
-		var lockedUserID string
-		if err := tx.GetContext(ctx, &lockedUserID, `SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID); err != nil {
-			return err
-		}
-		post, err := getPost(ctx, tx, input.PostID)
-		if errors.Is(err, sql.ErrNoRows) {
+		switch result {
+		case "ok":
+		case "not_found":
 			return NewAPIError(http.StatusNotFound, "post_not_found")
-		}
-		if err != nil {
-			return err
-		}
-		if post.AuthorID != userID {
+		case "forbidden":
 			return NewAPIError(http.StatusForbidden, "post_not_editable")
-		}
-		var deletions int
-		if err := tx.GetContext(ctx, &deletions, `
-   SELECT count(*) FROM posts p JOIN posting_windows w ON w.id = p.posting_window_id
-   WHERE p.author_id = $1 AND p.deleted_at IS NOT NULL
-     AND w.local_date = (SELECT local_date FROM posting_windows WHERE id = $2)
-  `, userID, post.PostingWindowID); err != nil {
-			return err
-		}
-		if deletions >= 2 {
+		case "slot_unavailable":
 			return NewAPIError(http.StatusConflict, "post_slot_unavailable")
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE posts SET deleted_at = clock_timestamp() WHERE id = $1`, post.ID); err != nil {
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			return err
+		case "user_not_found":
+			// 変更前は、本人の行のロックが sql.ErrNoRows になり 500 を返していた。
+			return sql.ErrNoRows
+		default:
+			return fmt.Errorf("unexpected delete post result: %q", result)
 		}
 		return c.NoContent(http.StatusNoContent)
 	}

@@ -264,3 +264,149 @@ BEGIN
     actor_user.id::text, actor_user.username::text, actor_user.secret_key_hash, actor_user.display_name, actor_user.bio,
     actor_user.profile_image_id::text, actor_user.region, actor_user.account_type, actor_user.status;
 END $$;
+
+-- 投稿の編集（updatePostHandler、#66）。
+-- out_result: ok / not_found（404 post_not_found）/ forbidden（403 post_not_editable）/ user_not_found（変更前と同じく 500）。
+-- 変更前と同じ順序：本人の行をロック → 投稿の確認（削除されていない）→ 作者か → 投稿期間が終わっていないか → 更新。
+-- 変更前は active の確認を更新の後に行い、active でなければロールバックして 500 にしていた。更新の前に確かめても、応答と DB に残る結果は同じ。
+-- 応答の作者は、変更前と同じくロックしたときの users の行を返す。
+CREATE OR REPLACE FUNCTION isureal_update_post(p_user_id text, p_post_id text, p_caption text, p_visibility text)
+RETURNS TABLE(out_result text,
+              out_id text, out_author_id text, out_posting_window_id text, out_image_id text, out_caption text, out_visibility text,
+              out_location_kind text, out_latitude numeric, out_longitude numeric, out_locality text, out_posted_at timestamptz,
+              out_on_time_deadline timestamptz, out_window_ended_at timestamptz,
+              out_user_id text, out_username text, out_secret_key_hash text, out_display_name text, out_bio text,
+              out_profile_image_id text, out_region text, out_account_type text, out_status text)
+LANGUAGE plpgsql AS $$
+DECLARE
+  u users%ROWTYPE;
+  post_author text;
+  window_ended timestamptz;
+BEGIN
+  SELECT * INTO u FROM users WHERE id = p_user_id FOR NO KEY UPDATE;
+  IF NOT FOUND THEN
+    RETURN QUERY SELECT 'user_not_found'::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text,
+      NULL::text, NULL::numeric, NULL::numeric, NULL::text, NULL::timestamptz, NULL::timestamptz, NULL::timestamptz,
+      NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text;
+    RETURN;
+  END IF;
+  SELECT p.author_id, w.ended_at INTO post_author, window_ended
+    FROM posts p JOIN posting_windows w ON w.id = p.posting_window_id
+    WHERE p.id = p_post_id AND p.deleted_at IS NULL;
+  IF NOT FOUND THEN
+    RETURN QUERY SELECT 'not_found'::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text,
+      NULL::text, NULL::numeric, NULL::numeric, NULL::text, NULL::timestamptz, NULL::timestamptz, NULL::timestamptz,
+      NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text;
+    RETURN;
+  END IF;
+  IF post_author <> p_user_id OR window_ended IS NOT NULL THEN
+    RETURN QUERY SELECT 'forbidden'::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text,
+      NULL::text, NULL::numeric, NULL::numeric, NULL::text, NULL::timestamptz, NULL::timestamptz, NULL::timestamptz,
+      NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text;
+    RETURN;
+  END IF;
+  IF u.status <> 'active' THEN
+    RETURN QUERY SELECT 'user_not_found'::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text,
+      NULL::text, NULL::numeric, NULL::numeric, NULL::text, NULL::timestamptz, NULL::timestamptz, NULL::timestamptz,
+      NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text;
+    RETURN;
+  END IF;
+  UPDATE posts SET caption = COALESCE(p_caption, caption), visibility = COALESCE(p_visibility, visibility) WHERE id = p_post_id;
+  RETURN QUERY SELECT 'ok'::text,
+    p.id::text, p.author_id::text, p.posting_window_id::text, p.image_id::text, p.caption, p.visibility,
+    p.location_kind, p.latitude, p.longitude, p.locality, p.posted_at, w.on_time_deadline, w.ended_at,
+    u.id::text, u.username::text, u.secret_key_hash, u.display_name, u.bio, u.profile_image_id::text, u.region, u.account_type, u.status
+    FROM posts p JOIN posting_windows w ON w.id = p.posting_window_id
+    WHERE p.id = p_post_id AND p.deleted_at IS NULL;
+END $$;
+
+-- 投稿の削除（deletePostHandler、#66）。
+-- 結果：ok / not_found（404 post_not_found）/ forbidden（403 post_not_editable）/ slot_unavailable（409 post_slot_unavailable）/
+-- user_not_found（変更前と同じく 500）。
+-- 変更前と同じ順序：本人の行をロック → 投稿の確認（削除されていない）→ 作者か → その日の削除の回数 → 削除。
+-- 変更前と同じく、投稿期間が終わっているか、本人が active かは確かめない。
+CREATE OR REPLACE FUNCTION isureal_delete_post(p_user_id text, p_post_id text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+  post_author text;
+  post_window text;
+  deletions int;
+BEGIN
+  PERFORM 1 FROM users WHERE id = p_user_id FOR NO KEY UPDATE;
+  IF NOT FOUND THEN
+    RETURN 'user_not_found';
+  END IF;
+  SELECT p.author_id, p.posting_window_id INTO post_author, post_window
+    FROM posts p JOIN posting_windows w ON w.id = p.posting_window_id
+    WHERE p.id = p_post_id AND p.deleted_at IS NULL;
+  IF NOT FOUND THEN
+    RETURN 'not_found';
+  END IF;
+  IF post_author <> p_user_id THEN
+    RETURN 'forbidden';
+  END IF;
+  SELECT count(*) INTO deletions
+    FROM posts p JOIN posting_windows w ON w.id = p.posting_window_id
+    WHERE p.author_id = p_user_id AND p.deleted_at IS NOT NULL
+      AND w.local_date = (SELECT pw.local_date FROM posting_windows pw WHERE pw.id = post_window);
+  IF deletions >= 2 THEN
+    RETURN 'slot_unavailable';
+  END IF;
+  UPDATE posts SET deleted_at = clock_timestamp() WHERE id = p_post_id;
+  RETURN 'ok';
+END $$;
+
+-- コメントの削除（deleteCommentHandler、#66）。
+-- 結果：ok / not_found（404 interaction_not_found）/ forbidden（403 interaction_forbidden）/ user_not_found（変更前と同じく 500）。
+-- 変更前と同じ順序とロック：本人の行を FOR NO KEY UPDATE → コメントの行を FOR UPDATE → コメントの作者か投稿者か → 削除。
+CREATE OR REPLACE FUNCTION isureal_delete_comment(p_actor text, p_comment_id text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+  comment_author text;
+  post_author text;
+BEGIN
+  PERFORM 1 FROM users WHERE id = p_actor FOR NO KEY UPDATE;
+  IF NOT FOUND THEN
+    RETURN 'user_not_found';
+  END IF;
+  SELECT c.author_id, p.author_id INTO comment_author, post_author
+    FROM comments c JOIN posts p ON p.id = c.post_id
+    WHERE c.id = p_comment_id AND c.deleted_at IS NULL
+    FOR UPDATE OF c;
+  IF NOT FOUND THEN
+    RETURN 'not_found';
+  END IF;
+  IF p_actor <> comment_author AND p_actor <> post_author THEN
+    RETURN 'forbidden';
+  END IF;
+  UPDATE comments SET deleted_at = clock_timestamp() WHERE id = p_comment_id;
+  RETURN 'ok';
+END $$;
+
+-- RealMoji の削除（deleteRealMojiHandler、#66）。
+-- 結果：ok / not_found（404 interaction_not_found）/ forbidden（403 interaction_forbidden）/ user_not_found（変更前と同じく 500）。
+-- 変更前と同じ順序とロック：本人の行を FOR NO KEY UPDATE → RealMoji の行を FOR UPDATE → リアクションした人か投稿者か → 削除。
+-- 変更前と同じく、置き換えられた（replaced_at がある）RealMoji も、削除されていなければ削除できる。
+CREATE OR REPLACE FUNCTION isureal_delete_realmoji(p_actor text, p_realmoji_id text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+  reactor text;
+  post_author text;
+BEGIN
+  PERFORM 1 FROM users WHERE id = p_actor FOR NO KEY UPDATE;
+  IF NOT FOUND THEN
+    RETURN 'user_not_found';
+  END IF;
+  SELECT r.reactor_id, p.author_id INTO reactor, post_author
+    FROM realmojis r JOIN posts p ON p.id = r.post_id
+    WHERE r.id = p_realmoji_id AND r.deleted_at IS NULL
+    FOR UPDATE OF r;
+  IF NOT FOUND THEN
+    RETURN 'not_found';
+  END IF;
+  IF p_actor <> reactor AND p_actor <> post_author THEN
+    RETURN 'forbidden';
+  END IF;
+  UPDATE realmojis SET deleted_at = clock_timestamp() WHERE id = p_realmoji_id;
+  RETURN 'ok';
+END $$;
