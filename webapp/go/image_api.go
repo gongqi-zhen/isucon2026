@@ -42,11 +42,12 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 
 		ctx := c.Request().Context()
+		startImageInvalidationPoller(h.DB)
 		verifiedKey := input.ImageID + "\x00" + input.Exp + "\x00" + input.Sig
 		if _, verified := verifiedSignatureCache.Get(verifiedKey); !verified {
-			secretKeyHash, cached := imageOwnerKeyCache.Get(input.ImageID)
+			owner, cached := imageOwnerKeyCache.Get(input.ImageID)
 			if !cached {
-				found, err := loadImageOwnerKey(ctx, h, input.ImageID, &secretKeyHash)
+				found, err := loadImageOwnerKey(ctx, h, input.ImageID, &owner)
 				if err != nil {
 					return err
 				}
@@ -54,14 +55,14 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 					return NewAPIError(http.StatusForbidden, "image_forbidden")
 				}
 			}
-			key, err := imageSigningKey(secretKeyHash)
+			key, err := imageSigningKey(owner.SecretKeyHash)
 			if err != nil {
 				return err
 			}
 			if !hmac.Equal(sig, imageSignature(key, input.ImageID, exp)) {
 				// キャッシュした鍵を使った場合は、元の実装と同じく所有者が退会済みなら abuse として扱わない。
 				if cached {
-					found, err := loadImageOwnerKey(ctx, h, input.ImageID, &secretKeyHash)
+					found, err := loadImageOwnerKey(ctx, h, input.ImageID, &owner)
 					if err != nil {
 						return err
 					}
@@ -75,26 +76,25 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 			verifiedSignatureCache.Add(verifiedKey, struct{}{}, 1, time.Unix(exp, 0))
 		}
 
-		// 削除状態は imageValidityTTL より古い結果を使わずに確認する。5秒以内の許容範囲に収まる。
+		// 削除状態は、無効化の一括検知（image_validity.go）か、imageValidityTTL より古くない確認の結果で判断する。
+		// どちらも、削除の5秒後には有効とみなさない。確認の結果は、クエリを送る前の時刻から数える。
 		object, cached := imageObjectCache.Get(input.ImageID)
 		if cached {
-			if _, valid := imageValidityCache.Get(input.ImageID); !valid {
-				var exists bool
-				if err := h.DB.GetContext(ctx, &exists, `SELECT EXISTS(SELECT 1 `+validImageFrom+`)`, input.ImageID); err != nil {
+			if !imageKnownValid(input.ImageID) {
+				owner, _ := imageOwnerKeyCache.Get(input.ImageID)
+				sentAt := time.Now()
+				row, valid, err := checkImageValidity(ctx, h.DB, input.ImageID, owner.OwnerID)
+				if err != nil {
 					return err
 				}
-				if !exists {
+				if !valid {
 					return NewAPIError(http.StatusForbidden, "image_forbidden")
 				}
-				imageValidityCache.Add(input.ImageID, struct{}{}, 1, time.Now().Add(imageValidityTTL))
+				markImageValid(input.ImageID, row.meta(), sentAt)
 			}
 		} else {
-			validatedAt := time.Now()
-			var row struct {
-				Data      []byte `db:"data"`
-				MediaType string `db:"media_type"`
-			}
-			err := h.DB.GetContext(ctx, &row, `SELECT i.data, i.media_type `+validImageFrom, input.ImageID)
+			sentAt := time.Now()
+			row, err := loadValidImageObject(ctx, h.DB, input.ImageID)
 			if errors.Is(err, sql.ErrNoRows) {
 				return NewAPIError(http.StatusForbidden, "image_forbidden")
 			}
@@ -103,7 +103,7 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 			}
 			object = cachedImageObject{Data: row.Data, MediaType: row.MediaType}
 			imageObjectCache.Add(input.ImageID, object, int64(len(row.Data)), time.Time{})
-			imageValidityCache.Add(input.ImageID, struct{}{}, 1, validatedAt.Add(imageValidityTTL))
+			markImageValid(input.ImageID, row.meta(), sentAt)
 		}
 		if exp <= time.Now().Unix() {
 			return NewAPIError(http.StatusForbidden, "image_forbidden")
@@ -112,28 +112,10 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 	}
 }
 
-// 画像が現在も参照されているか（プロフィール画像、削除されていない投稿、差し替え・削除されていない RealMoji）。
-const validImageFrom = `
-   FROM image_objects i JOIN users u ON u.id = i.owner_user_id AND u.status = 'active'
-   WHERE i.id = $1 AND (
-     u.profile_image_id = i.id
-     OR EXISTS (
-       SELECT 1 FROM posts p
-       WHERE p.image_id = i.id AND p.author_id = u.id AND p.deleted_at IS NULL
-     )
-     OR EXISTS (
-       SELECT 1 FROM realmojis r
-       JOIN posts p ON p.id = r.post_id AND p.deleted_at IS NULL
-       JOIN users author ON author.id = p.author_id AND author.status = 'active'
-       WHERE r.image_id = i.id AND r.reactor_id = u.id AND r.replaced_at IS NULL AND r.deleted_at IS NULL
-     )
-   )
-`
-
-// 所有者が active な画像について、所有者の secret_key_hash を取得してキャッシュする。
-func loadImageOwnerKey(ctx context.Context, h *HandlerContext, imageID string, secretKeyHash *string) (bool, error) {
-	err := h.DB.GetContext(ctx, secretKeyHash, `
-   SELECT u.secret_key_hash
+// 所有者が active な画像について、所有者の id と secret_key_hash を取得してキャッシュする。
+func loadImageOwnerKey(ctx context.Context, h *HandlerContext, imageID string, owner *imageOwner) (bool, error) {
+	err := h.DB.GetContext(ctx, owner, `
+   SELECT u.id AS owner_id, u.secret_key_hash
    FROM image_objects i JOIN users u ON u.id = i.owner_user_id
    WHERE i.id = $1 AND u.status = 'active'
   `, imageID)
@@ -143,6 +125,6 @@ func loadImageOwnerKey(ctx context.Context, h *HandlerContext, imageID string, s
 	if err != nil {
 		return false, err
 	}
-	imageOwnerKeyCache.Add(imageID, *secretKeyHash, 1, time.Time{})
+	imageOwnerKeyCache.Add(imageID, *owner, 1, time.Time{})
 	return true, nil
 }

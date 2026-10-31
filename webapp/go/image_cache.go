@@ -63,6 +63,14 @@ func (c *lruCache[K, V]) Add(key K, value V, cost int64, expiresAt time.Time) {
 	}
 }
 
+func (c *lruCache[K, V]) Remove(key K) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if element, ok := c.items[key]; ok {
+		c.removeElement(element)
+	}
+}
+
 func (c *lruCache[K, V]) Reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -92,13 +100,19 @@ type cachedImageObject struct {
 	MediaType string
 }
 
+// imageOwner は画像の所有者。OwnerID が空なら、所有者の id は分かっていない。
+type imageOwner struct {
+	OwnerID       string `db:"owner_id"`
+	SecretKeyHash string `db:"secret_key_hash"`
+}
+
 var (
 	// (署名鍵, imageID) -> 生成済みの署名。exp を丸めて同じ署名を使い回す。
 	signedURLCache = newLRUCache[string, signedURLEntry](200_000)
 	// 検証に成功した (imageID, exp, sig)。exp まで有効。
 	verifiedSignatureCache = newLRUCache[string, struct{}](200_000)
-	// imageID -> 所有者の secret_key_hash。所有者も secret_key_hash も変わらない。
-	imageOwnerKeyCache = newLRUCache[string, string](500_000)
+	// imageID -> 所有者の id と secret_key_hash。所有者も secret_key_hash も変わらない。
+	imageOwnerKeyCache = newLRUCache[string, imageOwner](500_000)
 	// imageID -> 画像本体。id ごとに中身は変わらない。
 	imageObjectCache = newLRUCache[string, cachedImageObject](envInt64("ISUREAL_IMAGE_CACHE_BYTES", 512<<20))
 	// imageID -> 有効だった時刻から imageValidityTTL の間だけ有効とみなす。
@@ -108,6 +122,7 @@ var (
 // アップロードを受け付けたプロセスで、確定した画像をそのままキャッシュに入れる。投稿直後の取得で DB を引かずに済む。
 // COMMIT が成功した後に呼ぶこと。validatedAt は COMMIT の前に取った時刻にする。
 // COMMIT の時点で画像は有効なので、そこから imageValidityTTL の間は有効とみなしても、削除の反映は TTL を超えて遅れない。
+// 有効である理由（投稿や持ち主）が分からないので、無効化の一括検知（imageValidity）には入れない。TTL を過ぎたら DB で確かめる。
 func cacheUploadedImage(imageID string, data []byte, validatedAt time.Time) {
 	imageObjectCache.Add(imageID, cachedImageObject{Data: data, MediaType: "image/jpeg"}, int64(len(data)), time.Time{})
 	imageValidityCache.Add(imageID, struct{}{}, 1, validatedAt.Add(imageValidityTTL))
@@ -119,6 +134,7 @@ func resetImageCaches() {
 	imageOwnerKeyCache.Reset()
 	imageObjectCache.Reset()
 	imageValidityCache.Reset()
+	imageValidity.reset()
 }
 
 func envInt64(key string, defaultValue int64) int64 {
