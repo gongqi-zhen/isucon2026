@@ -201,12 +201,12 @@ CREATE TABLE comments (
 );
 CREATE INDEX comments_post_id ON comments(post_id);
 
+-- 外部キーと (user_id, posting_window_id) の一意制約は付けない。理由は migrate.sql を参照（#41）。
 CREATE TABLE notifications (
   id varchar(36) PRIMARY KEY,
-  user_id varchar(36) NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-  posting_window_id varchar(36) NOT NULL REFERENCES posting_windows(id) ON DELETE RESTRICT,
-  created_at timestamptz NOT NULL,
-  UNIQUE(user_id,posting_window_id)
+  user_id varchar(36) NOT NULL,
+  posting_window_id varchar(36) NOT NULL,
+  created_at timestamptz NOT NULL
 );
 
 CREATE TABLE ip_bans (
@@ -232,3 +232,10 @@ CREATE INDEX posts_image_id ON posts(image_id);
 CREATE INDEX realmojis_image_id ON realmojis(image_id);
 CREATE INDEX comments_post_id_created_at ON comments(post_id, created_at, id) WHERE deleted_at IS NULL;
 CREATE INDEX notifications_user_id_created_at ON notifications(user_id, created_at, id);
+
+-- 初期化（reset.sql）で「初期データより後に追加された行」を消すときに使う（#41）。
+-- created_at は追記順に増えるので、挿入時のインデックス更新は右端への追記で済む。
+CREATE INDEX notifications_created_at ON notifications(created_at);
+CREATE INDEX comments_created_at ON comments(created_at);
+CREATE INDEX realmojis_created_at ON realmojis(created_at);
+CREATE INDEX posts_created_at ON posts(created_at);
