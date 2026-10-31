@@ -218,6 +218,7 @@ CREATE TABLE ip_bans (
 -- 検索条件に合わせたインデックス（既存のDBには migrate.sql で同じものを適用する）
 -- users.search_text 列と isureal_search_text 関数、その関連インデックスは migrate.sql で追加する
 CREATE INDEX users_username_id ON users(username, id);
+CREATE UNIQUE INDEX users_username_key ON users(username);
 CREATE INDEX login_sessions_token_hash_active ON login_sessions(token_hash) WHERE active = true;
 CREATE INDEX login_sessions_user_id_active ON login_sessions(user_id) WHERE active = true;
 CREATE INDEX administrator_sessions_token_hash_active ON administrator_sessions(token_hash) WHERE active = true;

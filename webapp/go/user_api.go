@@ -89,10 +89,7 @@ func registerHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		defer tx.Rollback()
-		// ユーザー名が一意である必要があります。
-		if _, err := tx.ExecContext(ctx, `LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE`); err != nil {
-			return err
-		}
+		// ユーザー名は一意。同時に同じユーザー名で登録された場合は、users_username_key の一意制約違反で 409 にする。
 		var exists bool
 		if err := tx.GetContext(ctx, &exists, `SELECT EXISTS(SELECT 1 FROM users WHERE username = $1)`, input.Username); err != nil {
 			return err
@@ -103,6 +100,9 @@ func registerHandler(h *HandlerContext) echo.HandlerFunc {
 		userID := uuid.NewString()
 		if _, err := tx.ExecContext(ctx, `INSERT INTO users (id, username, secret_key_hash, display_name, region, search_text) VALUES ($1, $2, $3, $4, $5, $6)`,
 			userID, input.Username, hex.EncodeToString(hash[:]), input.DisplayName, input.Region, userSearchText(input.Username, input.DisplayName)); err != nil {
+			if isUniqueViolation(err) {
+				return NewAPIError(http.StatusConflict, "username_taken")
+			}
 			return err
 		}
 		user, err := getUser(ctx, tx, userID)

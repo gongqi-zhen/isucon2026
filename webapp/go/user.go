@@ -85,6 +85,38 @@ func lockUsers(ctx context.Context, tx *sqlx.Tx, userIDs []string) (map[string]U
 	return locked, nil
 }
 
+// lockInteractionUsers は、投稿へのコメントや RealMoji のために、行為者を FOR NO KEY UPDATE、投稿者を FOR SHARE でロックし、id ごとの行を返す。
+// 同じ行為者の操作どうしは直列になり、同じ投稿者への別々の行為者からの操作は並行して進む。
+// 投稿者の FOR SHARE は、ブロックや友達関係の変更、投稿の編集・削除（どれも FOR NO KEY UPDATE を取る）とは衝突するので、それらとの順序は今まで通り保たれる。
+// デッドロックを避けるため、lockUsers と同じく id の昇順（COLLATE "C"）にロックする。LATERAL で外側の行を先にロックさせ、1往復で済ませる。
+// どちらかが見つからなければ sql.ErrNoRows を返す。status による絞り込みはしない。
+func lockInteractionUsers(ctx context.Context, tx *sqlx.Tx, actor, author string) (map[string]User, error) {
+	if actor == author {
+		return lockUsers(ctx, tx, []string{actor})
+	}
+	low, high := min(actor, author), max(actor, author)
+	lowMode, highMode := "FOR SHARE", "FOR SHARE"
+	if low == actor {
+		lowMode = "FOR NO KEY UPDATE"
+	} else {
+		highMode = "FOR NO KEY UPDATE"
+	}
+	columns := strings.Join(userColumns, ", ")
+	var row struct {
+		Low  User `db:"low"`
+		High User `db:"high"`
+	}
+	err := tx.GetContext(ctx, &row, `
+  SELECT `+userColumnsAs("l", "low")+`, `+userColumnsAs("h", "high")+`
+  FROM (SELECT `+columns+` FROM users WHERE id = $1 `+lowMode+`) l,
+  LATERAL (SELECT `+columns+` FROM users WHERE id = $2 AND l.id IS NOT NULL `+highMode+`) h
+ `, low, high)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]User{row.Low.ID: row.Low, row.High.ID: row.High}, nil
+}
+
 // activeUser は getUser と同じく、active でなければ sql.ErrNoRows を返し、画像署名の鍵を設定する。
 func activeUser(user User) (User, error) {
 	if user.Status != "active" {
