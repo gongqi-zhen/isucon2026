@@ -2,10 +2,13 @@ package isureal
 
 import (
 	"container/list"
+	"context"
 	"os"
 	"strconv"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // lruCache はコスト（件数やバイト数）の合計に上限を持つ LRU キャッシュ。
@@ -104,6 +107,17 @@ type cachedImageObject struct {
 type imageOwner struct {
 	OwnerID       string `db:"owner_id"`
 	SecretKeyHash string `db:"secret_key_hash"`
+	// CreatedAt は画像の行の created_at（パーティションのキー）。ゼロ値なら分かっていない（#101）。
+	// 投稿の画像は posts.posted_at と同じ値で保存される（#40）。
+	CreatedAt time.Time `db:"created_at"`
+}
+
+// createdAtArg は、CreatedAt を SQL の引数にする。分かっていなければ NULL にする。
+func (owner imageOwner) createdAtArg() *time.Time {
+	if owner.CreatedAt.IsZero() {
+		return nil
+	}
+	return &owner.CreatedAt
 }
 
 var (
@@ -126,6 +140,51 @@ var (
 func cacheUploadedImage(imageID string, data []byte, validatedAt time.Time) {
 	imageObjectCache.Add(imageID, cachedImageObject{Data: data, MediaType: "image/jpeg"}, int64(len(data)), time.Time{})
 	imageValidityCache.Add(imageID, struct{}{}, 1, validatedAt.Add(imageValidityTTL))
+}
+
+// 画像の DB からの読み込みを、画像の ID ごとにまとめる（#101）。
+// 同じ画像を同時に取りにきたリクエストは、先に送ったクエリの結果を待って使う。
+// europe と america では1回の読み込みに RTT とスロースタートの分（約 140〜520ms）がかかるので、その間に届いた分を DB に送らずに済む。
+var (
+	imageObjectLoads   singleflight.Group
+	imageValidityLoads singleflight.Group
+	// まとめたクエリは、最初のリクエストが切れても止めない（待っている別のリクエストのため）。その上限の時間。
+	imageSharedLoadTimeout = 10 * time.Second
+)
+
+type sharedImageLoad[T any] struct {
+	value  T
+	sentAt time.Time
+}
+
+// loadImageShared は、group の key ごとに load を1回だけ実行し、その結果と、クエリを送る直前の時刻（sentAt）を返す。
+// 有効性の結果は sentAt から数える（markImageValid）。待っていた側も、まとめたクエリの sentAt をそのまま使う。
+//
+// 「削除の5秒後には取得できない」を保つため、このリクエストが届いた時刻より imageValidityTTL 以上前に送ったクエリの結果は使わず、
+// 自分で引き直す。送った時刻がそれより後なら、届く5秒前までにコミットした削除は、そのクエリのスナップショットに含まれる。
+// （まとめなかった場合は、届いた後に送ったクエリの結果を使っていた。）
+func loadImageShared[T any](ctx context.Context, group *singleflight.Group, key string, load func(context.Context) (T, error)) (T, time.Time, error) {
+	arrivedAt := time.Now()
+	results := group.DoChan(key, func() (any, error) {
+		loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), imageSharedLoadTimeout)
+		defer cancel()
+		sentAt := time.Now()
+		value, err := load(loadCtx)
+		return sharedImageLoad[T]{value: value, sentAt: sentAt}, err
+	})
+	var zero T
+	select {
+	case <-ctx.Done():
+		return zero, time.Time{}, ctx.Err()
+	case result := <-results:
+		shared, _ := result.Val.(sharedImageLoad[T])
+		if shared.sentAt.Before(arrivedAt.Add(-imageValidityTTL)) {
+			sentAt := time.Now()
+			value, err := load(ctx)
+			return value, sentAt, err
+		}
+		return shared.value, shared.sentAt, result.Err
+	}
 }
 
 func resetImageCaches() {

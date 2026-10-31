@@ -388,15 +388,28 @@ type imageObjectValidityRow struct {
 	MediaType string `db:"media_type"`
 }
 
+// loadValidImageObjectQuery の画像の行は、created_at（$2）が分かっていれば (id, created_at) で引き、1つのパーティションだけを読む（#101）。
+// image_objects は created_at で月ごとのパーティション（約35）に分かれていて、id だけで引くと、行が見つかるまで古い順に各パーティションの索引を調べる。
+// 走行中に投稿された画像は新しいパーティションにあるので、ほぼ全部を調べることになる（テストのデータでは 36 のうち 27）。
+// $2 が NULL か、その時刻の行がなければ（初期データなど）、以前と同じく id だけで引く。
+// UNION ALL の後ろの枝は、前の枝が行を返せば LIMIT で実行されないので、往復は1回のまま。
+const loadValidImageObjectQuery = `
+   SELECT i.data, i.media_type, ` + imageValidityColumns + `
+   FROM (
+     (SELECT o.id, o.owner_user_id, o.data, o.media_type FROM image_objects o WHERE o.id = $1 AND o.created_at = $2::timestamptz)
+     UNION ALL
+     (SELECT o.id, o.owner_user_id, o.data, o.media_type FROM image_objects o WHERE o.id = $1)
+     LIMIT 1
+   ) i
+   JOIN users u ON u.id = i.owner_user_id AND u.status = 'active'` + imageValidityJoins + `
+   WHERE u.profile_image_id = i.id OR pi.id IS NOT NULL OR ri.post_id IS NOT NULL
+  `
+
 // loadValidImageObject は、有効な画像の中身と、有効である理由を1回で読む。有効でなければ sql.ErrNoRows を返す。
-func loadValidImageObject(ctx context.Context, db sqlx.QueryerContext, imageID string) (imageObjectValidityRow, error) {
+// createdAt は画像の行の created_at（分からなければ nil）。違っていても結果は変わらない（id だけで引き直す）。
+func loadValidImageObject(ctx context.Context, db sqlx.QueryerContext, imageID string, createdAt *time.Time) (imageObjectValidityRow, error) {
 	var row imageObjectValidityRow
-	err := sqlx.GetContext(ctx, db, &row, `
-   SELECT i.data, i.media_type, `+imageValidityColumns+`
-   FROM image_objects i JOIN users u ON u.id = i.owner_user_id AND u.status = 'active'`+imageValidityJoins+`
-   WHERE i.id = $1 AND (u.profile_image_id = i.id OR pi.id IS NOT NULL OR ri.post_id IS NOT NULL)
-   LIMIT 1
-  `, imageID)
+	err := sqlx.GetContext(ctx, db, &row, loadValidImageObjectQuery, imageID, createdAt)
 	return row, err
 }
 

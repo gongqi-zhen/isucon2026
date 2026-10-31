@@ -54,10 +54,25 @@ func verifiedSignatureKey(imageID, exp, sig string) string {
 // 署名に使う所有者の鍵と id をここで覚えておき、画像の取得時に所有者を DB に問い合わせる往復を省く。
 // 所有者の id は、画像の有効性の確認で image_objects を読まずに済ませるのに使う。
 func signedImageURL(user User, imageID string) string {
+	return signedImageURLAt(user, imageID, time.Time{})
+}
+
+// signedImageURLAt は signedImageURL と同じ。createdAt（画像の行の created_at。投稿の画像なら posts.posted_at）が分かっていれば、
+// 所有者と一緒に覚えておき、キャッシュにない画像を読むときにパーティションを絞り込むのに使う（#101）。ゼロ値なら覚えない。
+func signedImageURLAt(user User, imageID string, createdAt time.Time) string {
 	owner, ok := imageOwnerKeyCache.Get(imageID)
-	if user.SecretKeyHash != "" && (!ok || (owner.OwnerID == "" && user.ID != "")) {
-		owner = imageOwner{OwnerID: user.ID, SecretKeyHash: user.SecretKeyHash}
-		imageOwnerKeyCache.Add(imageID, owner, 1, time.Time{})
+	if user.SecretKeyHash != "" {
+		updated := owner
+		if !ok || (owner.OwnerID == "" && user.ID != "") {
+			updated = imageOwner{OwnerID: user.ID, SecretKeyHash: user.SecretKeyHash, CreatedAt: owner.CreatedAt}
+		}
+		if updated.CreatedAt.IsZero() {
+			updated.CreatedAt = createdAt
+		}
+		if !ok || updated != owner {
+			owner = updated
+			imageOwnerKeyCache.Add(imageID, owner, 1, time.Time{})
+		}
 	}
 	exp := time.Now().Add(imageURLLifetime).Unix()
 	exp -= exp % imageURLExpGranularity
