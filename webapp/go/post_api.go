@@ -75,7 +75,7 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
-		if !validJPEGWithin(imageData, 4096) {
+		if !cachedValidJPEGWithin(imageData, 4096) {
 			return NewAPIError(http.StatusBadRequest, "invalid_post")
 		}
 
