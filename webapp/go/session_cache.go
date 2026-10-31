@@ -64,6 +64,12 @@ import (
 // そこで、エントリに最後に get で使った時刻（lastUsedAt）を持ち、sessionCacheIdle を超えて使われていないエントリは、
 // 確かめ直しの対象から外して消す（checks）。次にそのトークンが使われたときは DB を引き直し（1往復）、put で入り直す。
 // 約束1〜3はそのまま成り立つ。消すだけで、validatedAt を進めない結果を使うことはなく、消したエントリの判定は DB に戻るだけである。
+//
+// 確かめ直しの送り方（#121）：europe と america から DB への1往復は約100ms で、確かめ直しは TTL（400ms）で打ち切る。
+// 1本ずつ送ると、1本が遅れたり打ち切られたりした間は validatedAt が進まず、キャッシュが一斉に外れていた。
+// そこで、前の1本の完了を待たずに sessionCacheInterval ごとに送る（同時に sessionCacheMaxInFlight 本まで）。
+// 遅れて返った古い結果は、validatedAt より後に送ったものでなければ使わず、evictedAt の判定も通すので、約束1〜3はそのまま成り立つ。
+// また、リクエストの処理と同じプールを使うと接続を借りる待ちで打ち切られるので、専用の小さなプールを使う（openSessionCacheDB）。
 
 var (
 	sessionCacheRegions  = parseSessionCacheRegions(envOrDefault("ISUREAL_SESSION_CACHE_REGIONS", "europe,america"))
@@ -72,6 +78,8 @@ var (
 	sessionCacheMax      = int(envInt64("ISUREAL_SESSION_CACHE_MAX", 100000))
 	// 最後に使ってからこれを超えたエントリは、確かめ直さずに消す（#110）。空や 0 以下は既定値。
 	sessionCacheIdle = time.Duration(envInt64("ISUREAL_SESSION_CACHE_IDLE_MS", 5000)) * time.Millisecond
+	// 同時に送る確かめ直しの上限と、その専用プールの接続数（#121）。TTL / interval（既定 4）より多くしても、TTL で打ち切るので増えない。
+	sessionCacheMaxInFlight = max(1, int(envInt64("ISUREAL_SESSION_CACHE_MAX_IN_FLIGHT", 4)))
 	// このプロセスのリージョンをキャッシュするのは、このプロセスだけであることを示す（#62）。
 	// 同じリージョンのアプリを2つ以上動かすとき（asia2 のアプリを動かす docs/asia-role-split.md の構成）は、どのプロセスにも設定しないこと。
 	sessionCacheSole = parseSessionCacheSole(os.Getenv("ISUREAL_SESSION_CACHE_SOLE"))
@@ -210,6 +218,10 @@ type sessionCache struct {
 	// 計測用のカウンタ（#108）。get の結果を数える。アトミックな加算だけなので、ロックは増えない。
 	hits   atomic.Int64
 	misses atomic.Int64
+	// 確かめ直しの回数、失敗（打ち切りを含む）、同時に送る上限に達して送らなかった回数（#121）。
+	revalidations        atomic.Int64
+	revalidationFailures atomic.Int64
+	revalidationSkipped  atomic.Int64
 }
 
 // sessionCacheStats は、/debug/vars 向けの状態と累計のカウンタ。
@@ -220,6 +232,10 @@ type sessionCacheStats struct {
 	Max     int    `json:"max"`
 	Hits    int64  `json:"hits"`
 	Misses  int64  `json:"misses"`
+	// 確かめ直しの回数、失敗、送らなかった回数（#121）。
+	Revalidations        int64 `json:"revalidations"`
+	RevalidationFailures int64 `json:"revalidation_failures"`
+	RevalidationSkipped  int64 `json:"revalidation_skipped"`
 }
 
 // stats は、/debug/vars 向けの状態と累計のカウンタを返す（#108）。
@@ -228,7 +244,29 @@ func (c *sessionCache) stats() sessionCacheStats {
 	stats := sessionCacheStats{Enabled: c.enabled, Region: c.region, Entries: len(c.entries), Max: sessionCacheMax}
 	c.mu.Unlock()
 	stats.Hits, stats.Misses = c.hits.Load(), c.misses.Load()
+	stats.Revalidations, stats.RevalidationFailures, stats.RevalidationSkipped =
+		c.revalidations.Load(), c.revalidationFailures.Load(), c.revalidationSkipped.Load()
 	return stats
+}
+
+// openSessionCacheDB は、確かめ直し専用のプールを開く（#121）。リクエストの処理で接続を借りる待ちに巻き込まれないようにする。
+// このリージョンをキャッシュしないなら、db をそのまま返す（確かめ直しをしないので、接続を増やさない）。
+// 増える接続は、キャッシュするプロセスごとに sessionCacheMaxInFlight 本（既定 4）。全台の合計を max_connections に収めること。
+func openSessionCacheDB(config *Config, db *sqlx.DB) *sqlx.DB {
+	if !sessionCacheRegions[config.Region] {
+		return db
+	}
+	sessionDB, err := openDB(config)
+	if err != nil {
+		log.Printf("session cache db: %v; sharing the request pool", err)
+		return db
+	}
+	sessionDB.SetMaxOpenConns(sessionCacheMaxInFlight)
+	sessionDB.SetMaxIdleConns(sessionCacheMaxInFlight)
+	sessionDB.SetConnMaxLifetime(config.DBConnMaxLifetime)
+	sessionDB.SetConnMaxIdleTime(config.DBConnMaxIdleTime)
+	startDBPoolWarmup(sessionDB.DB, sessionCacheMaxInFlight)
+	return sessionDB
 }
 
 // init は最初に使うときに1回だけ呼ばれ、リージョンを決めて、キャッシュするなら確かめ直しのループを始める。
@@ -244,7 +282,7 @@ func (c *sessionCache) init(region string, source sessionCacheSource) {
 		}
 		c.mu.Unlock()
 		if c.enabled {
-			go c.run(source)
+			go c.run(context.Background(), source, sessionCacheInterval)
 		}
 	})
 }
@@ -397,7 +435,7 @@ func (c *sessionCache) checks() []sessionCacheCheck {
 	return checks
 }
 
-// revalidate は、持っているトークン（sessionCacheIdle 以内に使われたもの）を1クエリで確かめ直す。
+// revalidate は、持っているトークン（sessionCacheIdle 以内に使われたもの）を1クエリで確かめ直す。同時に何本呼んでもよい（#121）。
 // 有効なものは validatedAt を送った時刻に進め、無効なものは消す。
 // その利用者を消した時刻より前に送ったクエリでは、有効でも validatedAt を進めない（約束3）。
 // 利用者の行は、validatedAt と一緒に、同じクエリの結果に合わせる（#58）。
@@ -439,15 +477,36 @@ func (c *sessionCache) revalidate(ctx context.Context, source sessionCacheSource
 	return nil
 }
 
-func (c *sessionCache) run(source sessionCacheSource) {
-	ticker := time.NewTicker(sessionCacheInterval)
+// run は、interval ごとに確かめ直しを送る。前の1本の完了は待たない（#121）。
+// 同時に送るのは sessionCacheMaxInFlight 本まで。上限に達していたら、その回は送らない。
+// 1本ごとに TTL で打ち切る（TTL より前に送ったクエリの結果では、使えるエントリにならないため）。
+// 結果は revalidate が validatedAt より後に送ったものだけを反映するので、返る順が入れ替わっても古い結果で戻らない。
+func (c *sessionCache) run(ctx context.Context, source sessionCacheSource, interval time.Duration) {
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	for range ticker.C {
-		ctx, cancel := context.WithTimeout(context.Background(), sessionCacheTTL)
-		if err := c.revalidate(ctx, source); err != nil {
-			log.Printf("session cache revalidation failed: %v", err)
+	inFlight := make(chan struct{}, sessionCacheMaxInFlight)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 		}
-		cancel()
+		select {
+		case inFlight <- struct{}{}:
+		default:
+			c.revalidationSkipped.Add(1)
+			continue
+		}
+		go func() {
+			defer func() { <-inFlight }()
+			ctx, cancel := context.WithTimeout(ctx, sessionCacheTTL)
+			defer cancel()
+			c.revalidations.Add(1)
+			if err := c.revalidate(ctx, source); err != nil {
+				c.revalidationFailures.Add(1)
+				log.Printf("session cache revalidation failed: %v", err)
+			}
+		}()
 	}
 }
 
