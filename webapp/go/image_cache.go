@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -20,6 +21,21 @@ type lruCache[K comparable, V any] struct {
 	ll      *list.List
 	items   map[K]*list.Element
 	now     func() time.Time
+	// 計測用のカウンタ（#108）。/debug/vars で読む。アトミックな加算だけなので、ロックは増えない。
+	// hits と misses は Get の結果（期限切れは misses）。evictions は Add で上限を超えて追い出した件数（同じキーの置き換えは数えない）。
+	hits      atomic.Int64
+	misses    atomic.Int64
+	evictions atomic.Int64
+}
+
+// lruCacheStats は、キャッシュの状態と累計のカウンタ。
+type lruCacheStats struct {
+	Len       int   `json:"len"`
+	Cost      int64 `json:"cost"`
+	MaxCost   int64 `json:"max_cost"`
+	Hits      int64 `json:"hits"`
+	Misses    int64 `json:"misses"`
+	Evictions int64 `json:"evictions"`
 }
 
 type lruEntry[K comparable, V any] struct {
@@ -39,14 +55,17 @@ func (c *lruCache[K, V]) Get(key K) (V, bool) {
 	var zero V
 	element, ok := c.items[key]
 	if !ok {
+		c.misses.Add(1)
 		return zero, false
 	}
 	entry := element.Value.(*lruEntry[K, V])
 	if !entry.expiresAt.IsZero() && !c.now().Before(entry.expiresAt) {
 		c.removeElement(element)
+		c.misses.Add(1)
 		return zero, false
 	}
 	c.ll.MoveToFront(element)
+	c.hits.Add(1)
 	return entry.value, true
 }
 
@@ -63,6 +82,7 @@ func (c *lruCache[K, V]) Add(key K, value V, cost int64, expiresAt time.Time) {
 	c.cost += cost
 	for c.cost > c.maxCost {
 		c.removeElement(c.ll.Back())
+		c.evictions.Add(1)
 	}
 }
 
@@ -86,6 +106,17 @@ func (c *lruCache[K, V]) Len() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.ll.Len()
+}
+
+// Stats は、/debug/vars 向けの状態と累計のカウンタを返す（#108）。
+func (c *lruCache[K, V]) Stats() lruCacheStats {
+	c.mu.Lock()
+	length, cost := c.ll.Len(), c.cost
+	c.mu.Unlock()
+	return lruCacheStats{
+		Len: length, Cost: cost, MaxCost: c.maxCost,
+		Hits: c.hits.Load(), Misses: c.misses.Load(), Evictions: c.evictions.Load(),
+	}
 }
 
 func (c *lruCache[K, V]) removeElement(element *list.Element) {

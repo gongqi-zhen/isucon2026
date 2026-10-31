@@ -58,9 +58,12 @@ func NewServer(config *Config) *echo.Echo {
 	handlerContext.IPBans.Start(context.Background())
 	e.Use(IPBanMiddleware(handlerContext))
 
+	// 接続プールとキャッシュの指標を、pprof と同じポートの /debug/vars に出す（metrics.go、#108）。
+	publishMetrics(db.DB)
+
 	if config.PprofAddr != "off" {
 		go func() {
-			// net/http/pprof は http.DefaultServeMux に登録される。採点対象のポートとは分ける。
+			// net/http/pprof と expvar は http.DefaultServeMux に登録される。採点対象のポートとは分ける。
 			if err := http.ListenAndServe(config.PprofAddr, nil); err != nil {
 				log.Printf("pprof server stopped: %v", err)
 			}
