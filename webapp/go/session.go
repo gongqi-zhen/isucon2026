@@ -51,7 +51,6 @@ func getSessionFromHeader(c *echo.Context, h *HandlerContext) (*Session, error) 
 		return nil, nil
 	}
 	if !strings.HasPrefix(authHeader, "Bearer ") {
-		c.Logger().Warn("Invalid authorization header format(not started with Bearer)")
 		return nil, NewAPIError(http.StatusUnauthorized, "invalid_session")
 	}
 

@@ -9,7 +9,7 @@ import (
 // 接続プールとキャッシュの指標（#108）。
 //
 // expvar を import すると、net/http/pprof と同じ http.DefaultServeMux に /debug/vars が登録される。
-// pprof のサーバ（Config.PprofAddr、既定 127.0.0.1:6060）から JSON で読める：
+// pprof のサーバ（Config.PprofAddr。既定は off で、計測するときに ISUREAL_PPROF_ADDR=127.0.0.1:6060 にする）から JSON で読める：
 //
 //	curl -s 127.0.0.1:6060/debug/vars | jq '{isureal_db, isureal_caches, isureal_session_cache, isureal_notification_hub}'
 //
