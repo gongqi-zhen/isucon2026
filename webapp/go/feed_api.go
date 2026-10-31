@@ -135,6 +135,56 @@ type feedCandidateRow struct {
 // 候補が0件のときは viewer を組み立てない（呼び出し元は使わない）。
 func selectFeedCandidates(ctx context.Context, db sqlx.QueryerContext, viewerID, feed string, beforePostedAt *time.Time, beforeID string, limited bool) (viewerContext, []feedCandidate, error) {
 	viewer := viewerContext{Friends: map[string]bool{}, FriendsOfFriends: map[string]bool{}, MutualFriends: map[string]int{}, Blocked: map[string]bool{}}
+	query, ok := feedCandidatesQueries[feedQueryKey{feed: feed, limited: limited}]
+	if !ok {
+		query = feedCandidatesQuery(feed, limited)
+	}
+	var rows []feedCandidateRow
+	if err := sqlx.SelectContext(ctx, db, &rows, query, viewerID, beforePostedAt, beforeID); err != nil {
+		return viewer, nil, err
+	}
+	if len(rows) == 0 {
+		return viewer, nil, nil
+	}
+	first := rows[0]
+	if first.BlockedIDs == nil || first.FriendIDs == nil || first.FriendsOfFriendsIDs == nil {
+		return viewer, nil, fmt.Errorf("feed candidates: relation lists missing on the first row")
+	}
+	viewer.ID = viewerID
+	viewer.HasPostedToday = true
+	if err := viewer.applyRelationLists(*first.BlockedIDs, *first.FriendIDs, *first.FriendsOfFriendsIDs); err != nil {
+		return viewer, nil, err
+	}
+	posts := make([]feedCandidate, len(rows))
+	for i := range rows {
+		posts[i] = rows[i].feedCandidate
+		if err := posts[i].Author.setImageKey(); err != nil {
+			return viewer, nil, err
+		}
+	}
+	return viewer, posts, nil
+}
+
+// feedQueryKey は、フィードのクエリの文字列を決める組み合わせ（フィードの種類と、51件に絞るかどうか）。
+type feedQueryKey struct {
+	feed    string
+	limited bool
+}
+
+// feedCandidatesQueries は、組み合わせごとのクエリの文字列。起動時に1回だけ組み立て、リクエストごとには組み立てない（#112）。
+// 文字列は feedCandidatesQuery が返すものと同じなので、pgx の文のキャッシュにもそのまま当たる。
+var feedCandidatesQueries = func() map[feedQueryKey]string {
+	queries := map[feedQueryKey]string{}
+	for _, feed := range []string{"friends", "friends-of-friends", "following", "public"} {
+		for _, limited := range []bool{false, true} {
+			queries[feedQueryKey{feed: feed, limited: limited}] = feedCandidatesQuery(feed, limited)
+		}
+	}
+	return queries
+}()
+
+// feedCandidatesQuery は、selectFeedCandidates が送るクエリの文字列を組み立てる。引数は $1 = 閲覧者、$2 = beforePostedAt、$3 = beforeID。
+func feedCandidatesQuery(feed string, limited bool) string {
 	feedCondition := ""
 	switch feed {
 	case "friends":
@@ -186,8 +236,7 @@ func selectFeedCandidates(ctx context.Context, db sqlx.QueryerContext, viewerID,
     WHERE f.user_low_id = c.author_id OR f.user_high_id = c.author_id
   ) connections`
 	}
-	var rows []feedCandidateRow
-	if err := sqlx.SelectContext(ctx, db, &rows, fmt.Sprintf(`
+	return fmt.Sprintf(`
   WITH `+viewerFriendsCTE+`,
   viewer AS (
     SELECT
@@ -234,29 +283,7 @@ func selectFeedCandidates(ctx context.Context, db sqlx.QueryerContext, viewerID,
   FROM candidates c CROSS JOIN viewer%s
   WINDOW first_row AS (ORDER BY c.posted_at DESC, c.id DESC)
   ORDER BY c.posted_at DESC, c.id DESC
- `, feedCondition, limit, scoreCTE, scoreColumns, scoreJoins), viewerID, beforePostedAt, beforeID); err != nil {
-		return viewer, nil, err
-	}
-	if len(rows) == 0 {
-		return viewer, nil, nil
-	}
-	first := rows[0]
-	if first.BlockedIDs == nil || first.FriendIDs == nil || first.FriendsOfFriendsIDs == nil {
-		return viewer, nil, fmt.Errorf("feed candidates: relation lists missing on the first row")
-	}
-	viewer.ID = viewerID
-	viewer.HasPostedToday = true
-	if err := viewer.applyRelationLists(*first.BlockedIDs, *first.FriendIDs, *first.FriendsOfFriendsIDs); err != nil {
-		return viewer, nil, err
-	}
-	posts := make([]feedCandidate, len(rows))
-	for i := range rows {
-		posts[i] = rows[i].feedCandidate
-		if err := posts[i].Author.setImageKey(); err != nil {
-			return viewer, nil, err
-		}
-	}
-	return viewer, posts, nil
+ `, feedCondition, limit, scoreCTE, scoreColumns, scoreJoins)
 }
 
 // mapKeys は値が true のキーの和集合を返す。SQL の配列パラメータに使うので、空でも nil にはしない。

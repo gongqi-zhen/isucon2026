@@ -90,7 +90,7 @@ europe1 と america1 は初期化のリクエストを受けないので、も�
 環境変数の既定値は今と同じなので、asia1、europe1、america1 は今と同じ動作をします。手順は #21 の「共通：アプリのデプロイ」と同じです。
 
 ```bash
-(cd webapp/go && go test ./... && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o ../../isureal.linux ./cmd/isureal)
+(cd webapp/go && go test ./... && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 GOAMD64=v3 go build -o ../../isureal.linux ./cmd/isureal)
 ```
 
 ### 4-2. asia2 にアプリを配置し、起動する

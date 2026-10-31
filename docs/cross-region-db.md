@@ -117,7 +117,7 @@ europe と america のリクエストの応答時間は、ほぼ「往復回数 
 反映（Issue #21 の「共通：アプリのデプロイ」と同じ。手元の repo のルートから、asia1、europe1、america1 の3台に反映する）：
 
 ```sh
-(cd webapp/go && go test ./... && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o ../../isureal.linux ./cmd/isureal)
+(cd webapp/go && go test ./... && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 GOAMD64=v3 go build -o ../../isureal.linux ./cmd/isureal)
 for h in asia1 europe1 america1; do
   echo "== $h"
   ssh $h 'cp ~/webapp/go/isureal ~/webapp/go/isureal.prev'

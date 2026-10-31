@@ -65,12 +65,17 @@ func newSessionUserResponse(user User) sessionUserResponse {
 }
 
 func newGetMeResponse(user User) getMeResponse {
-	response := getMeResponse{sessionUserResponse: newSessionUserResponse(user)}
-	if user.ProfileImageID != nil {
-		url := signedImageURL(user, *user.ProfileImageID)
-		response.ProfileImageURL = &url
+	return getMeResponse{sessionUserResponse: newSessionUserResponse(user), ProfileImageURL: profileImageURL(user)}
+}
+
+// profileImageURL は、プロフィール画像の署名付き URL を返す。画像がなければ nil。
+// 投稿の作者や一覧の利用者の応答も、これだけを使う（以前は newGetMeResponse で応答を丸ごと作って URL だけ取り出していた。#112）。
+func profileImageURL(user User) *string {
+	if user.ProfileImageID == nil {
+		return nil
 	}
-	return response
+	url := signedImageURL(user, *user.ProfileImageID)
+	return &url
 }
 
 func registerHandler(h *HandlerContext) echo.HandlerFunc {

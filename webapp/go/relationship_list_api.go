@@ -34,6 +34,19 @@ type getRelationshipsResponse struct {
 	HasMore bool                   `json:"hasMore"`
 }
 
+// 一覧のクエリの、種類ごとの副問い合わせ（query）の前後。起動時に1回だけ組み立てる（#112）。
+var (
+	relationshipsQueryHead = `
+   SELECT relations.id, relations.updated_at, ` + userColumnsAs("u", "user") + `
+   FROM (`
+	relationshipsQueryTail = `) relations
+   JOIN users u ON u.status = 'active'
+               AND u.id = CASE WHEN relations.first_id = $1 THEN relations.second_id ELSE relations.first_id END
+   WHERE ($2::timestamptz IS NULL OR (relations.updated_at, relations.id) < ($2, $3))
+   ORDER BY relations.updated_at DESC, relations.id DESC LIMIT 51
+  `
+)
+
 func getRelationshipsHandler(h *HandlerContext) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		var input getRelationshipsRequest
@@ -65,14 +78,7 @@ func getRelationshipsHandler(h *HandlerContext) echo.HandlerFunc {
 			UpdatedAt time.Time `db:"updated_at"`
 			User      User      `db:"user"`
 		}
-		if err := h.DB.SelectContext(ctx, &records, `
-   SELECT relations.id, relations.updated_at, `+userColumnsAs("u", "user")+`
-   FROM (`+query+`) relations
-   JOIN users u ON u.status = 'active'
-               AND u.id = CASE WHEN relations.first_id = $1 THEN relations.second_id ELSE relations.first_id END
-   WHERE ($2::timestamptz IS NULL OR (relations.updated_at, relations.id) < ($2, $3))
-   ORDER BY relations.updated_at DESC, relations.id DESC LIMIT 51
-  `, actor, input.BeforeUpdatedAt, input.BeforeID); err != nil {
+		if err := h.DB.SelectContext(ctx, &records, relationshipsQueryHead+query+relationshipsQueryTail, actor, input.BeforeUpdatedAt, input.BeforeID); err != nil {
 			return err
 		}
 		items := make([]relationshipResponse, 0, len(records))

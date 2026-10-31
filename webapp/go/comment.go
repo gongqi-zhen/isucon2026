@@ -31,12 +31,15 @@ type CommentWithAuthor struct {
 	Author User `db:"author"`
 }
 
+// クエリの文字列は起動時に1回だけ組み立てる（#112）。
+var selectCommentsWithAuthorQuery = `
+  SELECT c.id, c.post_id, c.author_id, c.body, c.created_at, c.deleted_at, ` + userColumnsAs("u", "author") + `
+  FROM comments c JOIN users u ON u.id = c.author_id AND u.status = 'active'
+  WHERE c.deleted_at IS NULL `
+
 func selectCommentsWithAuthor(ctx context.Context, db sqlx.QueryerContext, conditions string, args ...any) ([]CommentWithAuthor, error) {
 	var comments []CommentWithAuthor
-	if err := sqlx.SelectContext(ctx, db, &comments, `
-  SELECT c.id, c.post_id, c.author_id, c.body, c.created_at, c.deleted_at, `+userColumnsAs("u", "author")+`
-  FROM comments c JOIN users u ON u.id = c.author_id AND u.status = 'active'
-  WHERE c.deleted_at IS NULL `+conditions, args...); err != nil {
+	if err := sqlx.SelectContext(ctx, db, &comments, selectCommentsWithAuthorQuery+conditions, args...); err != nil {
 		return nil, err
 	}
 	for i := range comments {
@@ -79,21 +82,23 @@ type commentListRow struct {
 // listCommentsIfCommentable は、コメントの権限の確認と一覧を1回のクエリで読む（#65）。
 // 権限は canComment と同じ判定（isureal_can_comment）。権限がなければ false を返す。
 // 一覧は selectCommentsWithAuthor と同じ条件と並び順で、after より後のものを最大51件返す。
-func listCommentsIfCommentable(ctx context.Context, db sqlx.QueryerContext, viewerID, postID string, afterCreatedAt *time.Time, afterID string) (bool, []CommentWithAuthor, error) {
-	var rows []commentListRow
-	if err := sqlx.SelectContext(ctx, db, &rows, `
+var listCommentsIfCommentableQuery = `
   WITH access AS MATERIALIZED (SELECT isureal_can_comment($1, $2) AS allowed)
   SELECT access.allowed, c.*
   FROM access
   LEFT JOIN LATERAL (
-    SELECT c.id, c.post_id, c.author_id, c.body, c.created_at, c.deleted_at, `+userColumnsAs("u", "author")+`
+    SELECT c.id, c.post_id, c.author_id, c.body, c.created_at, c.deleted_at, ` + userColumnsAs("u", "author") + `
     FROM comments c JOIN users u ON u.id = c.author_id AND u.status = 'active'
     WHERE access.allowed AND c.deleted_at IS NULL AND c.post_id = $2
       AND ($3::timestamptz IS NULL OR (c.created_at, c.id) > ($3, $4))
     ORDER BY c.created_at, c.id LIMIT 51
   ) c ON true
   ORDER BY c.created_at, c.id
- `, viewerID, postID, afterCreatedAt, afterID); err != nil {
+ `
+
+func listCommentsIfCommentable(ctx context.Context, db sqlx.QueryerContext, viewerID, postID string, afterCreatedAt *time.Time, afterID string) (bool, []CommentWithAuthor, error) {
+	var rows []commentListRow
+	if err := sqlx.SelectContext(ctx, db, &rows, listCommentsIfCommentableQuery, viewerID, postID, afterCreatedAt, afterID); err != nil {
 		return false, nil, err
 	}
 	if len(rows) == 0 || !rows[0].Allowed {
