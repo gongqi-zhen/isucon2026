@@ -52,7 +52,7 @@ func replaceRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
-		if !validJPEGWithin(data, 512) {
+		if !cachedValidJPEGWithin(data, 512) {
 			return NewAPIError(http.StatusBadRequest, "invalid_realmoji")
 		}
 

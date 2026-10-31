@@ -1,10 +1,8 @@
 package isureal
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"image/jpeg"
 	"io"
 	"net/http"
 	"time"
@@ -22,12 +20,13 @@ func putProfileImageHandler(h *HandlerContext) echo.HandlerFunc {
 		if err != nil {
 			return err
 		}
-		img, err := jpeg.Decode(bytes.NewReader(data))
-		if err != nil {
+		// 判定は変更前と同じ（全体をデコードしてから縦横を確かめる）。同じ画像の結果は覚えておき、デコードを省く（#102）。
+		switch cachedProfileImageCheck(data) {
+		case jpegValid:
+		case jpegDecodeFailed:
 			c.Set("abuse", "invalid_image")
 			return NewAPIError(http.StatusBadRequest, "invalid_profile_image")
-		}
-		if img.Bounds().Dx() > 512 || img.Bounds().Dy() > 512 {
+		default:
 			return NewAPIError(http.StatusBadRequest, "invalid_profile_image")
 		}
 
