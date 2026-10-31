@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
 )
 
@@ -50,11 +49,6 @@ func isBlocked(ctx context.Context, db sqlx.QueryerContext, actor, target string
 	var blocked bool
 	err := sqlx.GetContext(ctx, db, &blocked, `SELECT EXISTS(SELECT 1 FROM block_relations WHERE (blocker_id=$1 AND blocked_id=$2) OR (blocker_id=$2 AND blocked_id=$1))`, actor, target)
 	return blocked, err
-}
-
-func insertFriendship(ctx context.Context, tx *sqlx.Tx, request FriendRequest) error {
-	_, err := tx.ExecContext(ctx, `INSERT INTO friendships (id, user_low_id, user_high_id, source_request_id) VALUES ($1,$2,$3,$4)`, uuid.NewString(), min(request.RequesterID, request.RecipientID), max(request.RequesterID, request.RecipientID), request.ID)
-	return err
 }
 
 func requireRelationshipChange(result sql.Result, err error, status int, code string) error {
