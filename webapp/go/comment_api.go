@@ -3,6 +3,7 @@ package isureal
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -37,40 +38,36 @@ func createCommentHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		ctx := c.Request().Context()
 		actor := GetSession(c).UserID
-		post, err := getPost(ctx, h.DB, input.PostID)
-		if errors.Is(err, sql.ErrNoRows) {
+		// 投稿の確認、2人のロック、コメントの権限の確認、追加を、DB の関数1回の呼び出しで行う（#50）。
+		var row struct {
+			Result    string     `db:"out_result"`
+			ID        *string    `db:"out_id"`
+			PostID    *string    `db:"out_post_id"`
+			AuthorID  *string    `db:"out_author_id"`
+			Body      *string    `db:"out_body"`
+			CreatedAt *time.Time `db:"out_created_at"`
+			funcUser
+		}
+		if err := h.DB.GetContext(ctx, &row, `
+   SELECT out_result, out_id, out_post_id, out_author_id, out_body, out_created_at, `+funcUserColumns+`
+   FROM isureal_create_comment($1, $2, $3, $4)
+  `, actor, input.PostID, uuid.NewString(), input.Body); err != nil {
+			return err
+		}
+		switch row.Result {
+		case "ok":
+		case "forbidden":
 			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
+		case "user_not_found":
+			return sql.ErrNoRows
+		default:
+			return fmt.Errorf("unexpected comment result: %q", row.Result)
 		}
+		user, err := activeUser(row.user())
 		if err != nil {
 			return err
 		}
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-		lockedUsers, err := lockInteractionUsers(ctx, tx, actor, post.AuthorID)
-		if err != nil {
-			return err
-		}
-		allowed, err := canComment(ctx, tx, actor, post.ID)
-		if err != nil {
-			return err
-		}
-		if !allowed {
-			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
-		}
-		var comment Comment
-		if err := tx.GetContext(ctx, &comment, `INSERT INTO comments(id,post_id,author_id,body,created_at) VALUES($1,$2,$3,$4,clock_timestamp()) RETURNING id,post_id,author_id,body,created_at,deleted_at`, uuid.NewString(), post.ID, actor, input.Body); err != nil {
-			return err
-		}
-		user, err := activeUser(lockedUsers[actor])
-		if err != nil {
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			return err
-		}
+		comment := Comment{ID: *row.ID, PostID: *row.PostID, AuthorID: *row.AuthorID, Body: *row.Body, CreatedAt: *row.CreatedAt}
 		return c.JSON(http.StatusCreated, newCommentResponse(comment, user))
 	}
 }

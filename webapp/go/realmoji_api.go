@@ -3,6 +3,7 @@ package isureal
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -59,57 +60,42 @@ func replaceRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 
 		ctx := c.Request().Context()
 		actor := GetSession(c).UserID
-		post, err := getPost(ctx, h.DB, input.PostID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
-		}
-		if err != nil {
-			return err
-		}
-		if actor == post.AuthorID {
-			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
-		}
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-		// 画像の送信は、リージョンをまたぐと時間がかかる。ほかの操作と衝突するロックを取る前に済ませておく。
+		// 投稿の確認、2人のロック、閲覧権限の確認、置き換えを、DB の関数1回の呼び出しで行う（#50）。
+		// アップロードした画像の有効期限は、確定より前に取った時刻から数える。
 		imageID := uuid.NewString()
-		if _, err := tx.ExecContext(ctx, `INSERT INTO image_objects(id,owner_user_id,data,media_type) VALUES($1,$2,$3,'image/jpeg')`, imageID, actor, data); err != nil {
-			return err
-		}
-		lockedUsers, err := lockInteractionUsers(ctx, tx, actor, post.AuthorID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return NewAPIError(http.StatusNotFound, "relationship_not_found")
-		}
-		if err != nil {
-			return err
-		}
-		if lockedUsers[actor].Status != "active" || lockedUsers[post.AuthorID].Status != "active" {
-			return NewAPIError(http.StatusNotFound, "relationship_not_found")
-		}
-		allowed, err := canViewPost(ctx, tx, actor, post.ID)
-		if err != nil {
-			return err
-		}
-		if !allowed {
-			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE realmojis SET replaced_at=clock_timestamp() WHERE post_id=$1 AND reactor_id=$2 AND replaced_at IS NULL AND deleted_at IS NULL`, post.ID, actor); err != nil {
-			return err
-		}
-		var reaction RealMoji
-		if err := tx.GetContext(ctx, &reaction, `INSERT INTO realmojis(id,post_id,reactor_id,image_id,reaction_type,created_at) VALUES($1,$2,$3,$4,$5,clock_timestamp()) RETURNING id, post_id, reactor_id, image_id, reaction_type, created_at, replaced_at, deleted_at`, uuid.NewString(), post.ID, actor, imageID, input.ReactionType); err != nil {
-			return err
-		}
-		user, err := activeUser(lockedUsers[actor])
-		if err != nil {
-			return err
-		}
 		validatedAt := time.Now()
-		if err := tx.Commit(); err != nil {
+		var row struct {
+			Result       string     `db:"out_result"`
+			ID           *string    `db:"out_id"`
+			PostID       *string    `db:"out_post_id"`
+			ReactorID    *string    `db:"out_reactor_id"`
+			ImageID      *string    `db:"out_image_id"`
+			ReactionType *string    `db:"out_reaction_type"`
+			CreatedAt    *time.Time `db:"out_created_at"`
+			funcUser
+		}
+		if err := h.DB.GetContext(ctx, &row, `
+   SELECT out_result, out_id, out_post_id, out_reactor_id, out_image_id, out_reaction_type, out_created_at, `+funcUserColumns+`
+   FROM isureal_create_realmoji($1, $2, $3, $4, $5, $6)
+  `, actor, input.PostID, uuid.NewString(), imageID, data, input.ReactionType); err != nil {
 			return err
+		}
+		switch row.Result {
+		case "ok":
+		case "forbidden":
+			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
+		case "not_found":
+			return NewAPIError(http.StatusNotFound, "relationship_not_found")
+		default:
+			return fmt.Errorf("unexpected realmoji result: %q", row.Result)
+		}
+		user, err := activeUser(row.user())
+		if err != nil {
+			return err
+		}
+		reaction := RealMoji{
+			ID: *row.ID, PostID: *row.PostID, ReactorID: *row.ReactorID, ImageID: *row.ImageID,
+			ReactionType: *row.ReactionType, CreatedAt: *row.CreatedAt,
 		}
 		cacheUploadedImage(imageID, data, validatedAt)
 		return c.JSON(http.StatusCreated, newRealMojiResponse(reaction, user))
