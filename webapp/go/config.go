@@ -16,6 +16,8 @@ type Config struct {
 	DBSSLMode  string
 	LogLevel   string
 	PprofAddr  string
+	ListenAddr string
+	DBMaxConns int
 }
 
 func ConfigFromEnv() *Config {
@@ -31,6 +33,10 @@ func ConfigFromEnv() *Config {
 		LogLevel:  envOrDefault("ISUREAL_LOG_LEVEL", "debug"),
 		// pprof の待ち受けアドレス。"off" で無効。
 		PprofAddr: envOrDefault("ISUREAL_PPROF_ADDR", "127.0.0.1:6060"),
+		// asia2 で動かすときは、VPC 内のアドレスだけで待ち受ける（docs/asia-role-split.md）。
+		ListenAddr: envOrDefault("ISUREAL_LISTEN_ADDR", ":8080"),
+		// 全台の合計が PostgreSQL の max_connections を超えないように、台ごとに変えられるようにする。
+		DBMaxConns: int(envInt64("ISUREAL_DB_MAX_CONNS", 64)),
 	}
 }
 
