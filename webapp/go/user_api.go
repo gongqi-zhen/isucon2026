@@ -151,6 +151,8 @@ func loginHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
+		// 以前のセッションを置き換えたので、ほかのプロセスのキャッシュに反映されるまで待つ。
+		waitSessionInvalidation(ctx, user.Region, user.ID)
 		return c.JSON(http.StatusOK, loginResponse{Token: session.Token, User: newSessionUserResponse(user)})
 	}
 }
@@ -164,6 +166,7 @@ func logoutHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := InvalidateLoginSession(h.DB, session.UserID, session.TokenHash); err != nil {
 			return err
 		}
+		waitSessionInvalidation(c.Request().Context(), session.Region, session.UserID)
 		return c.NoContent(http.StatusNoContent)
 	}
 }
@@ -236,6 +239,10 @@ func updateMeHandler(h *HandlerContext) echo.HandlerFunc {
 		}
 		if err := tx.Commit(); err != nil {
 			return err
+		}
+		if input.Region != nil && *input.Region != session.Region {
+			// 移る前のリージョンのプロセスにキャッシュがあれば、使われなくなるまで待つ。
+			waitSessionInvalidation(ctx, session.Region, session.UserID)
 		}
 		return c.JSON(http.StatusOK, updateMeResponse(newGetMeResponse(user)))
 	}
