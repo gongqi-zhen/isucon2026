@@ -22,6 +22,11 @@ type Session struct {
 	UserID    string    `db:"user_id"`
 	TokenHash string    `db:"token_hash"`
 	CreatedAt time.Time `db:"created_at"`
+	// User は、セッションと同じクエリで読んだ利用者の行（セッションをキャッシュするリージョンだけ。#58）。
+	// nil のときは、使う側が DB を引く。
+	User *User `db:"-" json:"-"`
+	// userFingerprint は、User を読んだときの行の md5（sessionUserFingerprint）。
+	userFingerprint string
 }
 
 func GetSession(c *echo.Context) *Session {
@@ -50,10 +55,31 @@ func getSessionFromHeader(c *echo.Context, h *HandlerContext) (*Session, error) 
 	if cached, ok := sessions.get(tokenHash); ok {
 		return cached, nil
 	}
-	var session Session
-	sentAt := time.Now()
-	err := h.DB.GetContext(c.Request().Context(), &session, `
+	if !sessions.caching() {
+		var session Session
+		err := h.DB.GetContext(c.Request().Context(), &session, `
 		SELECT s.user_id, s.token_hash, s.created_at, u.region
+		FROM login_sessions s JOIN users u ON u.id = s.user_id
+		WHERE s.token_hash = $1
+		  AND s.active = true AND u.status = 'active'
+	`, tokenHash)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to get session: %w", err)
+		}
+		return &session, nil
+	}
+	// キャッシュするリージョンでは、利用者の行も同じクエリで読み、一緒にキャッシュに入れる（#58）。
+	var row struct {
+		Session
+		User        User   `db:"user"`
+		Fingerprint string `db:"fingerprint"`
+	}
+	sentAt := time.Now()
+	err := h.DB.GetContext(c.Request().Context(), &row, `
+		SELECT s.user_id, s.token_hash, s.created_at, u.region, `+userColumnsAs("u", "user")+`, `+sessionUserFingerprint+` AS fingerprint
 		FROM login_sessions s JOIN users u ON u.id = s.user_id
 		WHERE s.token_hash = $1
 		  AND s.active = true AND u.status = 'active'
@@ -64,6 +90,11 @@ func getSessionFromHeader(c *echo.Context, h *HandlerContext) (*Session, error) 
 	if err != nil {
 		return nil, fmt.Errorf("failed to get session: %w", err)
 	}
+	if err := row.User.setImageKey(); err != nil {
+		return nil, err
+	}
+	session := row.Session
+	session.User, session.userFingerprint = &row.User, row.Fingerprint
 	sessions.put(session, sentAt)
 	return &session, nil
 }
