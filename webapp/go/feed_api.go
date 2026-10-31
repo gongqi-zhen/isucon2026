@@ -2,8 +2,6 @@ package isureal
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -59,20 +57,16 @@ func getFeedHandler(h *HandlerContext) echo.HandlerFunc {
 // buildFeed は入力の検証が済んだフィードの要求に対する応答を組み立てる。
 func buildFeed(ctx context.Context, db sqlx.QueryerContext, viewerID string, input getFeedRequest) (getFeedResponse, error) {
 	ranked := input.Feed == "friends-of-friends"
-	viewer, err := loadViewerContext(ctx, db, viewerID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return getFeedResponse{Items: []feedItemResponse{}}, nil
-	}
-	if err != nil {
-		return getFeedResponse{}, err
-	}
 	beforePostedAt, beforeID := input.BeforePostedAt, input.BeforeID
 	if ranked {
 		beforePostedAt, beforeID = nil, ""
 	}
-	posts, err := selectFeedCandidates(ctx, db, viewer, input.Feed, beforePostedAt, beforeID, !ranked)
+	viewer, posts, err := selectFeedCandidates(ctx, db, viewerID, input.Feed, beforePostedAt, beforeID, !ranked)
 	if err != nil {
 		return getFeedResponse{}, err
+	}
+	if len(posts) == 0 {
+		return getFeedResponse{Items: []feedItemResponse{}}, nil
 	}
 	// SQL と同じ条件で Go 側でも確認し、閲覧権限のない投稿を返さないようにする。
 	candidates := make([]PostWithAuthor, 0, len(posts))
@@ -112,56 +106,107 @@ func buildFeed(ctx context.Context, db sqlx.QueryerContext, viewerID string, inp
 	return getFeedResponse{Items: items, HasMore: hasMore}, nil
 }
 
+// feedCandidateRow は候補の投稿の1行。閲覧者の関係の一覧は1行目にだけ入る。
+type feedCandidateRow struct {
+	PostWithAuthor
+	BlockedIDs          *string `db:"blocked_ids"`
+	FriendIDs           *string `db:"friend_ids"`
+	FriendsOfFriendsIDs *string `db:"friends_of_friends_ids"`
+}
+
 // selectFeedCandidates は、viewer.canView と matchesFeed を満たす投稿を
 // posted_at DESC, id DESC の順で SQL で絞り込んで返す。limited のときは先頭51件だけを返す。
-func selectFeedCandidates(ctx context.Context, db sqlx.QueryerContext, viewer viewerContext, feed string, beforePostedAt *time.Time, beforeID string, limited bool) ([]PostWithAuthor, error) {
-	// 投稿者が自分以外なので、今日まだ投稿していなければ canView はすべて false になる。
-	if !viewer.HasPostedToday {
-		return nil, nil
-	}
-	friends := mapKeys(viewer.Friends)
-	friendsOrFriendsOfFriends := mapKeys(viewer.Friends, viewer.FriendsOfFriends)
-	args := []any{viewer.ID, mapKeys(viewer.Blocked), friends, friendsOrFriendsOfFriends}
+// 閲覧者の関係（ブロック、友達、友達の友達）も同じクエリで求めるので、DB への往復は1回で済む。
+// 閲覧者が active でないか今日まだ投稿していなければ、候補は0件になる（canView はすべて false なので）。
+// 候補が0件のときは viewer を組み立てない（呼び出し元は使わない）。
+func selectFeedCandidates(ctx context.Context, db sqlx.QueryerContext, viewerID, feed string, beforePostedAt *time.Time, beforeID string, limited bool) (viewerContext, []PostWithAuthor, error) {
+	viewer := viewerContext{Friends: map[string]bool{}, FriendsOfFriends: map[string]bool{}, MutualFriends: map[string]int{}, Blocked: map[string]bool{}}
 	feedCondition := ""
 	switch feed {
 	case "friends":
-		if len(friends) == 0 {
-			return nil, nil
-		}
-		feedCondition = `AND p.author_id = ANY($3::text[])`
+		feedCondition = `AND p.author_id = ANY(viewer.friends)`
 	case "friends-of-friends":
-		friendsOfFriendsOnly := make([]string, 0, len(viewer.FriendsOfFriends))
-		for id := range viewer.FriendsOfFriends {
-			if !viewer.Friends[id] {
-				friendsOfFriendsOnly = append(friendsOfFriendsOnly, id)
-			}
-		}
-		if len(friendsOfFriendsOnly) == 0 {
-			return nil, nil
-		}
-		args = append(args, friendsOfFriendsOnly)
-		feedCondition = fmt.Sprintf(`AND p.author_id = ANY($%d::text[])`, len(args))
+		feedCondition = `AND p.author_id = ANY(viewer.friends_of_friends) AND NOT (p.author_id = ANY(viewer.friends))`
 	case "following":
 		feedCondition = `AND p.author_id IN (SELECT followee_id FROM follows WHERE follower_id = $1)`
 	case "public":
 		feedCondition = `AND p.visibility = 'public'`
 	}
-	args = append(args, beforePostedAt, beforeID)
 	limit := ""
 	if limited {
 		limit = "LIMIT 51"
 	}
-	return selectPostsWithAuthor(ctx, db, fmt.Sprintf(`
-   AND p.author_id <> $1 AND w.ended_at IS NULL
-   AND NOT (p.author_id = ANY($2::text[]))
-   AND (p.visibility = 'public'
-     OR (p.visibility = 'friends' AND p.author_id = ANY($3::text[]))
-     OR (p.visibility = 'friends_of_friends' AND p.author_id = ANY($4::text[])))
-   %s
-   AND ($%d::timestamptz IS NULL OR (p.posted_at, p.id) < ($%d, $%d))
-   ORDER BY p.posted_at DESC, p.id DESC
-   %s
-  `, feedCondition, len(args)-1, len(args)-1, len(args), limit), args...)
+	var rows []feedCandidateRow
+	if err := sqlx.SelectContext(ctx, db, &rows, fmt.Sprintf(`
+  WITH `+viewerFriendsCTE+`,
+  viewer AS (
+    SELECT
+      ARRAY(
+        SELECT CASE WHEN blocker_id = $1 THEN blocked_id ELSE blocker_id END
+        FROM block_relations WHERE blocker_id = $1 OR blocked_id = $1
+      ) AS blocked,
+      ARRAY(SELECT id FROM viewer_friends) AS friends,
+      ARRAY(
+        SELECT f.user_high_id FROM friendships f WHERE f.user_low_id IN (SELECT id FROM viewer_friends)
+        UNION ALL
+        SELECT f.user_low_id FROM friendships f WHERE f.user_high_id IN (SELECT id FROM viewer_friends)
+      ) AS friends_of_friends
+    FROM users vu
+    WHERE vu.id = $1 AND vu.status = 'active' AND EXISTS(
+      SELECT 1 FROM posts vp
+      JOIN posting_windows posted ON posted.id = vp.posting_window_id
+      JOIN posting_windows current ON current.region = vu.region AND current.ended_at IS NULL
+                                  AND current.local_date = posted.local_date
+      WHERE vp.author_id = vu.id AND vp.deleted_at IS NULL
+    )
+  ),
+  candidates AS (
+    SELECT `+postColumns+`, `+userColumnsAs("u", "author")+`
+    FROM viewer
+    JOIN posts p ON p.deleted_at IS NULL AND p.author_id <> $1
+    JOIN posting_windows w ON w.id = p.posting_window_id
+    JOIN users u ON u.id = p.author_id AND u.status = 'active'
+    WHERE w.ended_at IS NULL
+      AND NOT (p.author_id = ANY(viewer.blocked))
+      AND (p.visibility = 'public'
+        OR (p.visibility = 'friends' AND p.author_id = ANY(viewer.friends))
+        OR (p.visibility = 'friends_of_friends'
+          AND (p.author_id = ANY(viewer.friends) OR p.author_id = ANY(viewer.friends_of_friends))))
+      %s
+      AND ($2::timestamptz IS NULL OR (p.posted_at, p.id) < ($2, $3))
+    ORDER BY p.posted_at DESC, p.id DESC
+    %s
+  )
+  SELECT c.*,
+    CASE WHEN row_number() OVER first_row = 1 THEN to_json(viewer.blocked)::text END AS blocked_ids,
+    CASE WHEN row_number() OVER first_row = 1 THEN to_json(viewer.friends)::text END AS friend_ids,
+    CASE WHEN row_number() OVER first_row = 1 THEN to_json(viewer.friends_of_friends)::text END AS friends_of_friends_ids
+  FROM candidates c CROSS JOIN viewer
+  WINDOW first_row AS (ORDER BY c.posted_at DESC, c.id DESC)
+  ORDER BY c.posted_at DESC, c.id DESC
+ `, feedCondition, limit), viewerID, beforePostedAt, beforeID); err != nil {
+		return viewer, nil, err
+	}
+	if len(rows) == 0 {
+		return viewer, nil, nil
+	}
+	first := rows[0]
+	if first.BlockedIDs == nil || first.FriendIDs == nil || first.FriendsOfFriendsIDs == nil {
+		return viewer, nil, fmt.Errorf("feed candidates: relation lists missing on the first row")
+	}
+	viewer.ID = viewerID
+	viewer.HasPostedToday = true
+	if err := viewer.applyRelationLists(*first.BlockedIDs, *first.FriendIDs, *first.FriendsOfFriendsIDs); err != nil {
+		return viewer, nil, err
+	}
+	posts := make([]PostWithAuthor, len(rows))
+	for i := range rows {
+		posts[i] = rows[i].PostWithAuthor
+		if err := posts[i].Author.setImageKey(); err != nil {
+			return viewer, nil, err
+		}
+	}
+	return viewer, posts, nil
 }
 
 // mapKeys は値が true のキーの和集合を返す。SQL の配列パラメータに使うので、空でも nil にはしない。
