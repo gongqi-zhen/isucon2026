@@ -8,6 +8,8 @@ User=isucon
 Group=isucon
 WorkingDirectory=/home/isucon/webapp/go
 EnvironmentFile=/home/isucon/env.sh
+# env.sh に無い場合の既定値。EnvironmentFile の値が優先される。
+Environment=ISUREAL_LOG_LEVEL=info
 ExecStart=/home/isucon/webapp/go/isureal
 Restart=on-failure
 RestartSec=5
