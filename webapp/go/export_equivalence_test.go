@@ -122,7 +122,16 @@ func TestExportMatchesLegacy(t *testing.T) {
 		if i%13 != 5 {
 			data := make([]byte, 1000+rng.Intn(50000))
 			rng.Read(data)
-			env.db.MustExec(`INSERT INTO image_objects (id, owner_user_id, data, media_type, created_at) VALUES ($1, $2, $3, 'image/jpeg', $4)`, imageID, user.id, data, postedAt)
+			// 画像の created_at は通常 posted_at と同じ。等式が成り立たない行（別の月、1マイクロ秒ずれ）も混ぜ、
+			// (id, created_at) で見つからなかった画像を id で引き直す経路も確かめる。
+			createdAt := postedAt
+			switch i % 11 {
+			case 2:
+				createdAt = postedAt.AddDate(0, 1, 0)
+			case 8:
+				createdAt = postedAt.Add(time.Microsecond)
+			}
+			env.db.MustExec(`INSERT INTO image_objects (id, owner_user_id, data, media_type, created_at) VALUES ($1, $2, $3, 'image/jpeg', $4)`, imageID, user.id, data, createdAt)
 		}
 		var deletedAt *time.Time
 		if i%7 == 3 {
