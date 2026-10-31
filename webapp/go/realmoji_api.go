@@ -1,8 +1,6 @@
 package isureal
 
 import (
-	"database/sql"
-	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -122,17 +120,13 @@ func getRealMojisHandler(h *HandlerContext) echo.HandlerFunc {
 		if (input.BeforeCreatedAt == nil) != (input.BeforeID == "") {
 			return NewAPIError(http.StatusBadRequest, "invalid_pagination")
 		}
-		ctx := c.Request().Context()
-		allowed, err := canViewPost(ctx, h.DB, GetSession(c).UserID, input.PostID)
+		// 閲覧権限の確認と一覧を、1回のクエリで読む（#65）。
+		allowed, reactions, err := listRealMojisIfViewable(c.Request().Context(), h.DB, GetSession(c).UserID, input.PostID, input.BeforeCreatedAt, input.BeforeID)
 		if err != nil {
 			return err
 		}
 		if !allowed {
 			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
-		}
-		reactions, err := selectCurrentRealMojis(ctx, h.DB, `AND r.post_id=$1 AND ($2::timestamptz IS NULL OR (r.created_at,r.id)<($2,$3)) ORDER BY r.created_at DESC,r.id DESC LIMIT 51`, input.PostID, input.BeforeCreatedAt, input.BeforeID)
-		if err != nil {
-			return err
 		}
 		items := make([]replaceRealMojiResponse, 0, len(reactions))
 		for _, reaction := range reactions {
@@ -156,35 +150,12 @@ func deleteRealMojiHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := c.Bind(&input); err != nil {
 			return err
 		}
-		ctx := c.Request().Context()
-		actor := GetSession(c).UserID
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
+		// 本人の行のロック、RealMoji の行のロック、権限の確認、削除を、DB の関数1回の呼び出しで行う（#66）。
+		var result string
+		if err := h.DB.GetContext(c.Request().Context(), &result, `SELECT isureal_delete_realmoji($1, $2)`, GetSession(c).UserID, input.RealMojiID); err != nil {
 			return err
 		}
-		defer tx.Rollback()
-		var lockedID string
-		if err := tx.GetContext(ctx, &lockedID, `SELECT id FROM users WHERE id=$1 FOR NO KEY UPDATE`, actor); err != nil {
-			return err
-		}
-		var record struct {
-			ReactorID string `db:"reactor_id"`
-			AuthorID  string `db:"author_id"`
-		}
-		err = tx.GetContext(ctx, &record, `SELECT r.reactor_id,p.author_id FROM realmojis r JOIN posts p ON p.id=r.post_id WHERE r.id=$1 AND r.deleted_at IS NULL FOR UPDATE OF r`, input.RealMojiID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return NewAPIError(http.StatusNotFound, "interaction_not_found")
-		}
-		if err != nil {
-			return err
-		}
-		if actor != record.ReactorID && actor != record.AuthorID {
-			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE realmojis SET deleted_at=clock_timestamp() WHERE id=$1`, input.RealMojiID); err != nil {
-			return err
-		}
-		if err := tx.Commit(); err != nil {
+		if err := interactionDeletionOutcome(result); err != nil {
 			return err
 		}
 		return c.NoContent(http.StatusNoContent)

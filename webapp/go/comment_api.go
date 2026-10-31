@@ -2,7 +2,6 @@ package isureal
 
 import (
 	"database/sql"
-	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -92,17 +91,13 @@ func getCommentsHandler(h *HandlerContext) echo.HandlerFunc {
 		if (input.AfterCreatedAt == nil) != (input.AfterID == "") {
 			return NewAPIError(http.StatusBadRequest, "invalid_pagination")
 		}
-		ctx := c.Request().Context()
-		allowed, err := canComment(ctx, h.DB, GetSession(c).UserID, input.PostID)
+		// コメントの権限の確認と一覧を、1回のクエリで読む（#65）。
+		allowed, comments, err := listCommentsIfCommentable(c.Request().Context(), h.DB, GetSession(c).UserID, input.PostID, input.AfterCreatedAt, input.AfterID)
 		if err != nil {
 			return err
 		}
 		if !allowed {
 			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
-		}
-		comments, err := selectCommentsWithAuthor(ctx, h.DB, `AND c.post_id=$1 AND ($2::timestamptz IS NULL OR (c.created_at,c.id)>($2,$3)) ORDER BY c.created_at,c.id LIMIT 51`, input.PostID, input.AfterCreatedAt, input.AfterID)
-		if err != nil {
-			return err
 		}
 		items := make([]createCommentResponse, 0, len(comments))
 		for _, comment := range comments {
@@ -126,35 +121,12 @@ func deleteCommentHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := c.Bind(&input); err != nil {
 			return err
 		}
-		ctx := c.Request().Context()
-		actor := GetSession(c).UserID
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
+		// 本人の行のロック、コメントの行のロック、権限の確認、削除を、DB の関数1回の呼び出しで行う（#66）。
+		var result string
+		if err := h.DB.GetContext(c.Request().Context(), &result, `SELECT isureal_delete_comment($1, $2)`, GetSession(c).UserID, input.CommentID); err != nil {
 			return err
 		}
-		defer tx.Rollback()
-		var lockedID string
-		if err := tx.GetContext(ctx, &lockedID, `SELECT id FROM users WHERE id=$1 FOR NO KEY UPDATE`, actor); err != nil {
-			return err
-		}
-		var record struct {
-			AuthorID     string `db:"author_id"`
-			PostAuthorID string `db:"post_author_id"`
-		}
-		err = tx.GetContext(ctx, &record, `SELECT c.author_id,p.author_id AS post_author_id FROM comments c JOIN posts p ON p.id=c.post_id WHERE c.id=$1 AND c.deleted_at IS NULL FOR UPDATE OF c`, input.CommentID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return NewAPIError(http.StatusNotFound, "interaction_not_found")
-		}
-		if err != nil {
-			return err
-		}
-		if actor != record.AuthorID && actor != record.PostAuthorID {
-			return NewAPIError(http.StatusForbidden, "interaction_forbidden")
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE comments SET deleted_at=clock_timestamp() WHERE id=$1`, input.CommentID); err != nil {
-			return err
-		}
-		if err := tx.Commit(); err != nil {
+		if err := interactionDeletionOutcome(result); err != nil {
 			return err
 		}
 		return c.NoContent(http.StatusNoContent)
