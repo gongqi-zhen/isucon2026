@@ -70,6 +70,25 @@ ALTER TABLE notifications DROP CONSTRAINT IF EXISTS notifications_user_id_fkey;
 ALTER TABLE notifications DROP CONSTRAINT IF EXISTS notifications_posting_window_id_fkey;
 ALTER TABLE notifications DROP CONSTRAINT IF EXISTS notifications_user_id_posting_window_id_key;
 
+-- 画像本体（平均 約370KB の JPEG）を、TOAST で圧縮しようとしない（#119）。
+-- 既定の extended では INSERT のたびに pglz で圧縮を試すが、JPEG は縮まないので必ず失敗し、非圧縮で保存される。
+-- external にしても保存される中身と読み出しの結果は同じで、圧縮の試行（1枚 約3.9ms の CPU）だけがなくなる。
+-- 親に対する ALTER は、今あるパーティションにも反映され、PARTITION OF で作るパーティションにも引き継がれる。
+-- 既存の行は書き換えない。反映済みのときは ALTER（とそのロック）を省き、初期化のたびにロックを取らない。
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_attribute a
+    WHERE a.attname = 'data' AND a.attstorage <> 'e'
+      AND a.attrelid IN (
+        SELECT 'image_objects'::regclass
+        UNION ALL SELECT inhrelid FROM pg_inherits WHERE inhparent = 'image_objects'::regclass
+      )
+  ) THEN
+    ALTER TABLE image_objects ALTER COLUMN data SET STORAGE EXTERNAL;
+  END IF;
+END $$;
+
 -- 利用者の退会・リージョンの変更・行の削除を、SSE で待っている接続を持つ各プロセスに pg_notify で知らせる（#110）。
 -- 以前は各プロセスが 500ms ごとに、待機中の全接続の利用者を users から引き直していた（notification_hub.go の checkUsers）。
 -- チャンネル名は notification_hub.go の userChangeNotifyChannel と同じにすること。ペイロードは利用者の id。
