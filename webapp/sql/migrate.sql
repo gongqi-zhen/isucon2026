@@ -70,6 +70,28 @@ ALTER TABLE notifications DROP CONSTRAINT IF EXISTS notifications_user_id_fkey;
 ALTER TABLE notifications DROP CONSTRAINT IF EXISTS notifications_posting_window_id_fkey;
 ALTER TABLE notifications DROP CONSTRAINT IF EXISTS notifications_user_id_posting_window_id_key;
 
+-- 利用者の退会・リージョンの変更・行の削除を、SSE で待っている接続を持つ各プロセスに pg_notify で知らせる（#110）。
+-- 以前は各プロセスが 500ms ごとに、待機中の全接続の利用者を users から引き直していた（notification_hub.go の checkUsers）。
+-- チャンネル名は notification_hub.go の userChangeNotifyChannel と同じにすること。ペイロードは利用者の id。
+-- 通知は COMMIT のときだけ届く（ロールバックでは届かない）。
+-- reset.sql は session_replication_role = replica で流すので、初期化の変更ではこのトリガは動かない。
+-- その分は、残してある間隔の長いポーリング（notificationUserCheckInterval）が拾う。
+CREATE OR REPLACE FUNCTION isureal_notify_user_change() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM pg_notify('isureal_users', OLD.id);
+  RETURN NULL;
+END $$;
+
+CREATE OR REPLACE TRIGGER users_notify_change
+AFTER UPDATE OF status, region ON users FOR EACH ROW
+WHEN (OLD.status IS DISTINCT FROM NEW.status OR OLD.region IS DISTINCT FROM NEW.region)
+EXECUTE FUNCTION isureal_notify_user_change();
+
+CREATE OR REPLACE TRIGGER users_notify_change_on_delete
+AFTER DELETE ON users FOR EACH ROW
+EXECUTE FUNCTION isureal_notify_user_change();
+
 -- 友達関係の操作を、ロックの取得から確定までを DB の中で行う関数にする（#33 案A）。
 -- アプリは autocommit の1文で呼ぶので、users 行のロックを持つのは関数の実行中だけになり、
 -- europe・america からの往復（約100ms）の間ロックを持ち続けることがなくなる。

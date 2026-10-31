@@ -191,6 +191,8 @@ func TestNotificationHubKeepsUsersOnError(t *testing.T) {
 func TestNotificationHubRun(t *testing.T) {
 	source := &fakeNotificationSource{windows: []string{"w1"}, regions: map[string]string{"u1": "asia"}}
 	hub := newNotificationHub(source)
+	// 利用者の確認のポーリングは取りこぼしの保険として残している（#110）。ここではその経路を短い間隔で確かめる。
+	hub.userCheckInterval = 200 * time.Millisecond
 	waiter := hub.subscribe("u1", "asia")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -222,5 +224,88 @@ func TestNotificationHubRun(t *testing.T) {
 	case <-waiter.gone:
 	case <-time.After(2 * time.Second):
 		t.Fatal("deleted user not closed")
+	}
+}
+
+// #110：LISTEN で受け取った利用者の変更は、その利用者の接続だけを確かめて閉じる。ほかの利用者は DB に問い合わせない。
+func TestNotificationHubChecksOnlyChangedUsers(t *testing.T) {
+	source := &fakeNotificationSource{regions: map[string]string{"active": "asia", "moved": "europe", "other": "asia"}}
+	hub := newNotificationHub(source)
+	active := hub.subscribe("active", "asia")
+	other := hub.subscribe("other", "asia")
+	moved := hub.subscribe("moved", "asia")
+	movedAgain := hub.subscribe("moved", "asia")
+	deleted := hub.subscribe("deleted", "asia")
+	ctx := context.Background()
+
+	hub.checkUsersFor(ctx, []string{"moved", "deleted", "nobody-waiting"})
+	if isGone(active) || isGone(other) {
+		t.Fatal("users that did not change must not be closed")
+	}
+	if !isGone(moved) || !isGone(movedAgain) {
+		t.Fatal("every connection of the user who changed region must be closed")
+	}
+	if !isGone(deleted) {
+		t.Fatal("deleted user must be closed")
+	}
+	if len(source.userCalls) != 1 {
+		t.Fatalf("want one query, got %d", len(source.userCalls))
+	}
+	if got := source.userCalls[0]; len(got) != 2 || got[0] != "deleted" || got[1] != "moved" {
+		t.Fatalf("query must cover only the changed users with waiters, deduplicated and sorted, got %v", got)
+	}
+
+	// 待っている接続のない利用者だけなら、問い合わせない。
+	hub.checkUsersFor(ctx, []string{"nobody-waiting"})
+	if len(source.userCalls) != 1 {
+		t.Fatal("no waiter for the changed user: no query expected")
+	}
+}
+
+// #110：notifyUserChanged で渡した利用者は、ポーリングを待たずに確かめられる。たまった分はまとめて1クエリで引く。
+func TestNotificationHubUserChangeIsCheckedWithoutPolling(t *testing.T) {
+	source := &fakeNotificationSource{windows: []string{"w1"}, regions: map[string]string{"active": "asia"}}
+	hub := newNotificationHub(source)
+	hub.windowPollInterval = time.Hour
+	hub.userCheckInterval = time.Hour
+	active := hub.subscribe("active", "asia")
+	deleted := hub.subscribe("deleted", "asia")
+	moved := hub.subscribe("moved", "asia")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go hub.run(ctx)
+
+	hub.notifyUserChanged("deleted")
+	hub.notifyUserChanged("moved")
+	for _, waiter := range []*notificationWaiter{deleted, moved} {
+		select {
+		case <-waiter.gone:
+		case <-time.After(time.Second):
+			t.Fatal("changed user must be closed without waiting for the poll")
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+	if isGone(active) {
+		t.Fatal("unchanged user must stay")
+	}
+	source.mu.Lock()
+	calls := len(source.userCalls)
+	source.mu.Unlock()
+	if calls < 1 || calls > 2 {
+		t.Fatalf("want 1 or 2 queries (changes may be batched), got %d", calls)
+	}
+}
+
+func TestNotificationHubUserCheckIntervalDefault(t *testing.T) {
+	if notificationUserCheckInterval != 5*time.Second {
+		t.Fatalf("notificationUserCheckInterval = %v, want 5s (LISTEN/NOTIFY is the primary path, #110)", notificationUserCheckInterval)
+	}
+	hub := newNotificationHub(&fakeNotificationSource{})
+	if hub.userCheckInterval != notificationUserCheckInterval || cap(hub.userChanges) != userChangeQueueSize {
+		t.Fatal("hub must start with the default interval and queue size")
+	}
+	// ためておける数を超えても notifyUserChanged は止まらない。
+	for range userChangeQueueSize + 10 {
+		hub.notifyUserChanged("u")
 	}
 }
