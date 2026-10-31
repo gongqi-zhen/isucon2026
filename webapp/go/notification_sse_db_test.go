@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -197,25 +198,78 @@ func TestNotificationPendingMatchesPerConnectionQuery(t *testing.T) {
 	}
 }
 
+// countingBatchSource は、まとめ取りの呼び出しを calls に知らせる。最初の failures 回は失敗させる。
+type countingBatchSource struct {
+	notificationBatchSource
+	calls    chan struct{}
+	mu       sync.Mutex
+	failures int
+}
+
+func newCountingBatchSource(source notificationBatchSource, failures int) *countingBatchSource {
+	return &countingBatchSource{notificationBatchSource: source, calls: make(chan struct{}, 64), failures: failures}
+}
+
+func (s *countingBatchSource) PendingNotifications(ctx context.Context, keys []notificationKey) ([]string, []*getNotificationsResponse, error) {
+	select {
+	case s.calls <- struct{}{}:
+	default:
+	}
+	s.mu.Lock()
+	fail := s.failures > 0
+	if fail {
+		s.failures--
+	}
+	s.mu.Unlock()
+	if fail {
+		return nil, nil, errors.New("injected batch failure")
+	}
+	return s.notificationBatchSource.PendingNotifications(ctx, keys)
+}
+
+func (s *countingBatchSource) waitCall(t *testing.T, timeout time.Duration, what string) {
+	t.Helper()
+	select {
+	case <-s.calls:
+	case <-time.After(timeout):
+		t.Fatal(what)
+	}
+}
+
+func (s *countingBatchSource) drain() {
+	for {
+		select {
+		case <-s.calls:
+		default:
+			return
+		}
+	}
+}
+
+func (env *lockTestEnv) clock() time.Time {
+	env.t.Helper()
+	var now time.Time
+	if err := env.db.Get(&now, `SELECT clock_timestamp()`); err != nil {
+		env.t.Fatal(err)
+	}
+	return now
+}
+
 // ポーリングを実質止めても、LISTEN で投稿期間の開始を受け取って通知を渡すこと。接続が切れてもつなぎ直すこと。
 func TestNotificationListenerWakesHub(t *testing.T) {
 	env := newLockTestEnv(t)
 	admin := env.adminToken()
 	dsn := os.Getenv("ISUREAL_TEST_DSN")
-	hub := newNotificationHub(dbNotificationSource{db: env.db})
+	source := newCountingBatchSource(dbNotificationSource{db: env.db}, 0)
+	hub := newNotificationHub(source)
 	hub.windowPollInterval = time.Hour
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go hub.run(ctx)
 
-	// 接続した時刻が決まっていない接続は、起こされるたびに changed で知らされる。LISTEN の開始を知るのに使う。
-	probe := hub.subscribe("probe", "asia")
+	// LISTEN を始めるとハブが起こされ、まとめ取りをする。それで LISTEN の開始を知る。
 	go hub.listen(ctx, dsn)
-	select {
-	case <-probe.changed:
-	case <-time.After(5 * time.Second):
-		t.Fatal("listener did not start")
-	}
+	source.waitCall(t, 5*time.Second, "listener did not start")
 
 	u := env.user("asia")
 	var connectedAt time.Time
@@ -223,7 +277,7 @@ func TestNotificationListenerWakesHub(t *testing.T) {
 		t.Fatal(err)
 	}
 	waiter := hub.subscribe(u.id, "asia")
-	waiter.setConnectedAt(connectedAt)
+	hub.setConnectedAt(waiter, connectedAt)
 	windowID := env.mustOpenWindow(admin)
 	select {
 	case got := <-waiter.delivered:
@@ -234,17 +288,13 @@ func TestNotificationListenerWakesHub(t *testing.T) {
 
 	// LISTEN している接続を DB 側から切っても、つなぎ直して届けること。
 	// 投稿期間を開いたときの知らせが残っているので、先に捨てる。
-	signaled(probe)
+	source.drain()
 	if _, err := env.db.Exec(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE query = $1`, "LISTEN "+postingWindowNotifyChannel); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case <-probe.changed:
-	case <-time.After(5 * time.Second):
-		t.Fatal("listener did not reconnect")
-	}
+	source.waitCall(t, 5*time.Second, "listener did not reconnect")
 	waiter2 := hub.subscribe(u.id, "asia")
-	waiter2.setConnectedAt(connectedAt)
+	hub.setConnectedAt(waiter2, connectedAt)
 	windowID = env.mustOpenWindow(admin)
 	deadline := time.After(2 * time.Second)
 	for {
@@ -296,5 +346,74 @@ func TestPostingWindowOpenSendsNotifyOnCommit(t *testing.T) {
 	}
 	if payload, ok := wait(300 * time.Millisecond); ok {
 		t.Fatalf("rolled back open must not notify, got %q", payload)
+	}
+}
+
+// 接続した時刻が決まる前に投稿期間が開き、まとめ取りがあっても、時刻が決まった後のまとめ取りで届くこと（#83）。
+// その接続は自分で通知を引かない（changed で知らされない）。
+func TestNotificationLateConnectedAtDeliveredByBatch(t *testing.T) {
+	env := newLockTestEnv(t)
+	admin := env.adminToken()
+	source := newCountingBatchSource(dbNotificationSource{db: env.db}, 0)
+	hub := newNotificationHub(source)
+	hub.windowPollInterval = time.Hour
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go hub.run(ctx)
+
+	u := env.user("asia")
+	// getNotificationsHandler と同じ順：購読してから、接続した時刻を読む。
+	waiter := hub.subscribe(u.id, "asia")
+	connectedAt := env.clock()
+	// 時刻を読んでから、それをハブに渡すまでの間に投稿期間が開き、ハブがまとめ取りをする。
+	windowID := env.mustOpenWindow(admin)
+	hub.notifyWindowChanged()
+	source.waitCall(t, 2*time.Second, "hub did not run the batch")
+	if _, ok := delivered(waiter); ok {
+		t.Fatal("waiter without connectedAt must not get a notification yet")
+	}
+
+	hub.setConnectedAt(waiter, connectedAt)
+	select {
+	case got := <-waiter.delivered:
+		env.expectNotification(t, u, got, windowID)
+	case <-time.After(2 * time.Second):
+		t.Fatal("notification was not delivered after connectedAt was set")
+	}
+	if signaled(waiter) {
+		t.Fatal("waiter must not be told to query by itself")
+	}
+}
+
+// まとめ取りが続けて失敗しても、上限の回数に届くまでは各接続に引かせず、やり直したまとめ取りで全員に届くこと（#83）。
+func TestNotificationBatchFailureRetriesWithoutPerConnectionQueries(t *testing.T) {
+	env := newLockTestEnv(t)
+	admin := env.adminToken()
+	source := newCountingBatchSource(dbNotificationSource{db: env.db}, notificationBatchMaxFailures-1)
+	hub := newNotificationHub(source)
+	hub.windowPollInterval = 20 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	users := []lockTestUser{env.user("asia"), env.user("asia"), env.user("asia")}
+	waiters := make([]*notificationWaiter, len(users))
+	connectedAt := env.clock()
+	for i, u := range users {
+		waiters[i] = hub.subscribe(u.id, "asia")
+		hub.setConnectedAt(waiters[i], connectedAt)
+	}
+	windowID := env.mustOpenWindow(admin)
+	go hub.run(ctx)
+
+	for i, u := range users {
+		select {
+		case got := <-waiters[i].delivered:
+			env.expectNotification(t, u, got, windowID)
+		case <-time.After(3 * time.Second):
+			t.Fatalf("user %d: notification not delivered after batch retries", i)
+		}
+		if signaled(waiters[i]) {
+			t.Fatalf("user %d: must not be told to query by itself before %d failures", i, notificationBatchMaxFailures)
+		}
 	}
 }

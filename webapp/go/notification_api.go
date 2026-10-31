@@ -26,6 +26,7 @@ func getNotificationsHandler(h *HandlerContext) echo.HandlerFunc {
 		// 接続した時刻を読むクエリより前に購読する。
 		// 返す通知は created_at > connectedAt のものだけで、その投稿期間を開始したトランザクションは connectedAt より後に確定する。
 		// ハブがそれを検知するのは確定より後、つまり購読より後なので、この接続は必ず知らされる（changed か delivered）。
+		// 接続した時刻が決まる前にハブがまとめ取りをしていたら、setConnectedAt がハブを起こし、次のまとめ取りに入れる。
 		// そのため、以前は接続ごとに最初に1回引いていた通知の確認を省ける。
 		hub := getNotificationHub(h)
 		waiter := hub.subscribe(userID, session.Region)
@@ -52,7 +53,7 @@ func getNotificationsHandler(h *HandlerContext) echo.HandlerFunc {
 			return nil
 		}
 		connectedAt := connection.ConnectedAt
-		waiter.setConnectedAt(connectedAt)
+		hub.setConnectedAt(waiter, connectedAt)
 		send := func(notification getNotificationsResponse) error {
 			data, err := json.Marshal(notification)
 			if err != nil {
@@ -75,7 +76,7 @@ func getNotificationsHandler(h *HandlerContext) echo.HandlerFunc {
 				return send(notification)
 			case <-waiter.changed:
 			}
-			// ハブがまとめて引けなかったとき（購読した直後、クエリの失敗）は、以前と同じくこの接続で引く。
+			// ハブのまとめ取りが続けて失敗したとき（notificationBatchMaxFailures）と、まとめ取りをしない source では、この接続で引く。
 			var notification getNotificationsResponse
 			err := h.DB.GetContext(ctx, &notification, `
     SELECT n.id, n.posting_window_id, w.region, n.created_at

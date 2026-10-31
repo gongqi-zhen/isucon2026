@@ -73,8 +73,15 @@ func TestNotificationHubBatchDelivers(t *testing.T) {
 	if len(source.batchCalls) != 1 || len(source.batchCalls[0]) != 3 {
 		t.Fatalf("first check must fetch once for the 3 ready waiters, got %v", source.batchCalls)
 	}
-	if !signaled(notReady) {
-		t.Fatal("waiter without connectedAt must be signaled to query by itself")
+	// 接続した時刻がまだの接続は、自分で引かせない（#83）。時刻が決まったときにハブを起こす。
+	if signaled(notReady) {
+		t.Fatal("waiter without connectedAt must not be signaled to query by itself")
+	}
+	if !notReady.setConnectedAt(base) {
+		t.Fatal("waiter that missed a batch must report it when connectedAt is set")
+	}
+	if notReady.setConnectedAt(base) {
+		t.Fatal("missed flag must be cleared once reported")
 	}
 
 	source.windows = []string{"w2"}
@@ -99,23 +106,147 @@ func TestNotificationHubBatchDelivers(t *testing.T) {
 	}
 }
 
-func TestNotificationHubBatchErrorFallsBack(t *testing.T) {
+// まとめ取りが失敗しても、各接続に引かせず（N クエリにせず）、次の確認でまとめ取りをやり直すこと（#83）。
+func TestNotificationHubBatchErrorRetries(t *testing.T) {
+	base := time.Now()
+	notification := getNotificationsResponse{ID: "n1", PostingWindowID: "w1", Region: "asia", CreatedAt: base.Add(time.Second)}
+	source := &fakeBatchSource{windows: []string{"w1"}, pending: map[string]getNotificationsResponse{"u1": notification}, err: errors.New("db down")}
+	hub := newNotificationHub(source)
+	waiters := []*notificationWaiter{hub.subscribe("u1", "asia"), hub.subscribe("u2", "asia"), hub.subscribe("u3", "asia")}
+	for _, w := range waiters {
+		w.setConnectedAt(base)
+	}
+	ctx := context.Background()
+
+	for i := 1; i < notificationBatchMaxFailures; i++ {
+		hub.checkWindows(ctx)
+		for j, w := range waiters {
+			if signaled(w) {
+				t.Fatalf("failure %d: waiter %d must not be signaled before %d failures", i, j, notificationBatchMaxFailures)
+			}
+		}
+	}
+	if len(source.batchCalls) != notificationBatchMaxFailures-1 {
+		t.Fatalf("each check after a failure must retry the batch, got %d calls", len(source.batchCalls))
+	}
+
+	// 失敗の後は、一覧が同じでも次回の確認でまとめ取りをやり直し、届ける。
+	source.err = nil
+	hub.checkWindows(ctx)
+	if got, ok := delivered(waiters[0]); !ok || got != notification {
+		t.Fatalf("recovery must deliver by batch, got %v %v", got, ok)
+	}
+	for j, w := range waiters {
+		if signaled(w) {
+			t.Fatalf("waiter %d must not be signaled after recovery", j)
+		}
+	}
+}
+
+// まとめ取りが notificationBatchMaxFailures 回続けて失敗したら、以前と同じく各接続に引かせること。
+// 知らせた後は数え直す。成功したら失敗の回数を0に戻す。
+func TestNotificationHubBatchErrorFallsBackAfterRepeatedFailures(t *testing.T) {
 	source := &fakeBatchSource{windows: []string{"w1"}, err: errors.New("db down")}
 	hub := newNotificationHub(source)
 	ready := hub.subscribe("u1", "asia")
 	ready.setConnectedAt(time.Now())
+	notReady := hub.subscribe("u2", "asia")
 	ctx := context.Background()
 
-	hub.checkWindows(ctx)
+	fail := func(n int) {
+		t.Helper()
+		for i := 0; i < n; i++ {
+			hub.checkWindows(ctx)
+		}
+	}
+	fail(notificationBatchMaxFailures - 1)
+	if signaled(ready) {
+		t.Fatal("must not fall back before the limit")
+	}
+	fail(1)
 	if !signaled(ready) {
-		t.Fatal("on batch error, ready waiters must be signaled to query by themselves")
+		t.Fatal("after repeated batch errors, ready waiters must be signaled to query by themselves")
+	}
+	if signaled(notReady) {
+		t.Fatal("waiter without connectedAt cannot query yet; it must wait for its own wake")
+	}
+	fail(notificationBatchMaxFailures - 1)
+	if signaled(ready) {
+		t.Fatal("counter must restart after falling back")
+	}
+	fail(1)
+	if !signaled(ready) {
+		t.Fatal("must fall back again after another run of failures")
 	}
 
-	// 失敗の後は、一覧が同じでも次回の確認で必ずもう一度知らせる。
+	// 成功を挟むと、失敗の回数は0から数え直す。
+	fail(notificationBatchMaxFailures - 1)
 	source.err = nil
 	hub.checkWindows(ctx)
-	if len(source.batchCalls) != 2 {
-		t.Fatalf("recovery after error must fetch again, got %d calls", len(source.batchCalls))
+	source.err = errors.New("db down")
+	source.windows = []string{"w2"}
+	fail(notificationBatchMaxFailures - 1)
+	if signaled(ready) {
+		t.Fatal("success must reset the failure counter")
+	}
+}
+
+// 接続した時刻が決まる前にまとめ取りがあった接続は、時刻が決まったときにハブを起こし、
+// 次のまとめ取りで通知を受け取ること（#83）。その接続は自分で引かない。
+func TestNotificationHubLateConnectedAtJoinsBatch(t *testing.T) {
+	base := time.Now()
+	source := &fakeBatchSource{windows: []string{"w1"}, pending: map[string]getNotificationsResponse{}}
+	hub := newNotificationHub(source)
+	hub.windowPollInterval = time.Hour
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go hub.run(ctx)
+	batchCalls := func() int {
+		source.mu.Lock()
+		defer source.mu.Unlock()
+		return len(source.batchCalls)
+	}
+
+	waiter := hub.subscribe("u1", "asia")
+	notification := getNotificationsResponse{ID: "n1", PostingWindowID: "w2", Region: "asia", CreatedAt: base.Add(time.Second)}
+	source.mu.Lock()
+	source.windows = []string{"w2"}
+	source.pending["u1"] = notification
+	source.mu.Unlock()
+	hub.notifyWindowChanged()
+	deadline := time.Now().Add(time.Second)
+	for batchCalls() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("hub did not run the batch")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	source.mu.Lock()
+	if len(source.batchCalls[0]) != 0 {
+		t.Fatalf("waiter without connectedAt must not be in the batch, got %v", source.batchCalls[0])
+	}
+	source.mu.Unlock()
+
+	hub.setConnectedAt(waiter, base)
+	select {
+	case got := <-waiter.delivered:
+		if got != notification {
+			t.Fatalf("got %v, want %v", got, notification)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiter whose connectedAt was set late did not receive the notification")
+	}
+	if signaled(waiter) {
+		t.Fatal("waiter must not be told to query by itself")
+	}
+
+	// まとめ取りを逃していない接続は、時刻が決まってもハブを起こさない。
+	before := batchCalls()
+	other := hub.subscribe("u2", "asia")
+	hub.setConnectedAt(other, base)
+	time.Sleep(50 * time.Millisecond)
+	if after := batchCalls(); after != before {
+		t.Fatalf("waiter that missed nothing must not wake the hub, got %d extra calls", after-before)
 	}
 }
 

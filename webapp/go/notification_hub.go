@@ -27,6 +27,10 @@ const (
 	postingWindowNotifyChannel = "isureal_posting_windows"
 	// LISTEN の接続が切れたときに、つなぎ直すまで待つ時間。
 	postingWindowListenRetry = time.Second
+	// まとめ取りがこの回数続けて失敗したら、待機中の接続に changed で知らせ、各接続に自分で引かせる（#83）。
+	// それまでは知らせず、次の確認でまとめ取りをやり直す。DB が重いときに、接続の数だけクエリが並ばないようにする。
+	// 3回はポーリングの間隔で約300ms。知らせた後は数え直すので、失敗が続く間も各接続が引くのは3回に1回になる。
+	notificationBatchMaxFailures = 3
 )
 
 type notificationSource interface {
@@ -148,8 +152,11 @@ type notificationWaiter struct {
 	goneOnce sync.Once
 
 	mu sync.Mutex
-	// 接続した時刻（DB の clock_timestamp）。設定されるまでは、ハブはまとめて引かずに changed で知らせる。
+	// 接続した時刻（DB の clock_timestamp）。設定されるまでは、ハブはこの接続をまとめ取りに入れられない。
 	connectedAt *time.Time
+	// 接続した時刻が決まる前に、ハブがまとめ取りをした（変化を知らせ損ねた）。
+	// 時刻が決まったときにハブを起こし、次のまとめ取りに入れる（#83）。
+	missed bool
 }
 
 func (w *notificationWaiter) signal() {
@@ -171,16 +178,23 @@ func (w *notificationWaiter) markGone() {
 }
 
 // setConnectedAt を呼んだ後は、ハブがこの接続の通知をまとめて引いて渡す。
-func (w *notificationWaiter) setConnectedAt(connectedAt time.Time) {
+// それまでにハブがまとめ取りをしていたら true を返す。そのときは、ハブを起こしてまとめ取りに入れさせること。
+func (w *notificationWaiter) setConnectedAt(connectedAt time.Time) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.connectedAt = &connectedAt
+	missed := w.missed
+	w.missed = false
+	return missed
 }
 
+// key は、まとめ取りに入れる条件を返す。接続した時刻がまだなければ、知らせ損ねたことを覚えておく。
+// setConnectedAt と同じロックの中で判定するので、どちらの順で呼ばれても、この接続はまとめ取りに入るか、ハブを起こす。
 func (w *notificationWaiter) key() (notificationKey, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.connectedAt == nil {
+		w.missed = true
 		return notificationKey{}, false
 	}
 	return notificationKey{UserID: w.userID, ConnectedAt: *w.connectedAt}, true
@@ -193,6 +207,8 @@ type NotificationHub struct {
 	// 最後に確認できた開いている投稿期間。nil は未確認（またはエラー後）を表し、次回の確認で必ず全員に知らせる。
 	// run の goroutine だけが読み書きする。
 	windows []string
+	// まとめ取りが続けて失敗した回数。run の goroutine だけが読み書きする。
+	batchFailures int
 	// LISTEN で投稿期間の開始を受け取ったときに、すぐ確認させる。
 	wake               chan struct{}
 	windowPollInterval time.Duration
@@ -228,6 +244,13 @@ func (hub *NotificationHub) subscribe(userID, region string) *notificationWaiter
 	hub.waiters[waiter] = struct{}{}
 	hub.mu.Unlock()
 	return waiter
+}
+
+// setConnectedAt は、接続した時刻を決める。それまでにまとめ取りがあったら、ハブを起こしてこの接続を入れさせる。
+func (hub *NotificationHub) setConnectedAt(waiter *notificationWaiter, connectedAt time.Time) {
+	if waiter.setConnectedAt(connectedAt) {
+		hub.notifyWindowChanged()
+	}
 }
 
 func (hub *NotificationHub) unsubscribe(waiter *notificationWaiter) {
@@ -307,9 +330,10 @@ func (hub *NotificationHub) checkWindowsNow(ctx context.Context) {
 }
 
 // deliverPending は、待機中の全員の通知を1クエリで引き、見つかった接続に渡す。
-//   - 接続した時刻がまだ決まっていない接続には、以前と同じく changed で知らせる（その接続が自分で引く）。
+//   - 接続した時刻がまだ決まっていない接続は、知らせ損ねたことを覚えておく。時刻が決まったときにハブを起こし、次のまとめ取りに入れる。
 //   - 通知が見つからなかった接続は、以前の「引いたが行がなかった」と同じく、そのまま待たせる。
-//   - クエリが失敗したら、以前と同じく全員に changed で知らせ、各接続が自分で引く。次回の確認でも必ず全員に知らせる。
+//   - クエリが失敗したら、次回の確認で必ずまとめ取りをやり直す（hub.windows = nil）。
+//     notificationBatchMaxFailures 回続けて失敗したときだけ、全員に changed で知らせ、各接続に自分で引かせる。
 func (hub *NotificationHub) deliverPending(ctx context.Context, batch notificationBatchSource) {
 	waiters := hub.snapshot()
 	ready := make([]*notificationWaiter, 0, len(waiters))
@@ -317,7 +341,6 @@ func (hub *NotificationHub) deliverPending(ctx context.Context, batch notificati
 	for _, waiter := range waiters {
 		key, ok := waiter.key()
 		if !ok {
-			waiter.signal()
 			continue
 		}
 		ready = append(ready, waiter)
@@ -326,11 +349,16 @@ func (hub *NotificationHub) deliverPending(ctx context.Context, batch notificati
 	windows, pending, err := batch.PendingNotifications(ctx, keys)
 	if err != nil {
 		hub.windows = nil
-		for _, waiter := range ready {
-			waiter.signal()
+		hub.batchFailures++
+		if hub.batchFailures >= notificationBatchMaxFailures {
+			hub.batchFailures = 0
+			for _, waiter := range ready {
+				waiter.signal()
+			}
 		}
 		return
 	}
+	hub.batchFailures = 0
 	if windows == nil {
 		windows = []string{}
 	}
