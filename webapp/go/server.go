@@ -1,7 +1,11 @@
 package isureal
 
 import (
+	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
+	"time"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/labstack/echo/v5"
@@ -31,7 +35,12 @@ func NewServer(config *Config) *echo.Echo {
 	if err != nil {
 		panic("failed to open database: " + err.Error())
 	}
-	db.SetMaxOpenConns(30)
+	// idle を MaxOpen と揃え、リージョンをまたぐ接続の作り直しを防ぐ。
+	// 3 台分の合計が PostgreSQL の max_connections (etc/postgresql/conf.d/isucon.conf) を超えないこと。
+	db.SetMaxOpenConns(64)
+	db.SetMaxIdleConns(64)
+	db.SetConnMaxLifetime(10 * time.Minute)
+	db.SetConnMaxIdleTime(5 * time.Minute)
 	err = db.Ping()
 	if err != nil {
 		panic("failed to ping database: " + err.Error())
@@ -43,6 +52,15 @@ func NewServer(config *Config) *echo.Echo {
 		IPBans: &IPBanList{},
 	}
 	e.Use(IPBanMiddleware(handlerContext))
+
+	if config.PprofAddr != "off" {
+		go func() {
+			// net/http/pprof は http.DefaultServeMux に登録される。採点対象のポートとは分ける。
+			if err := http.ListenAndServe(config.PprofAddr, nil); err != nil {
+				log.Printf("pprof server stopped: %v", err)
+			}
+		}()
+	}
 
 	e.POST("/api/initialize", initializeHandler(handlerContext))
 	e.POST("/api/auth/register", registerHandler(handlerContext))
