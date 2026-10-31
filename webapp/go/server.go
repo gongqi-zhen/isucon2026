@@ -6,7 +6,6 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
-	"time"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/labstack/echo/v5"
@@ -32,20 +31,24 @@ func NewServer(config *Config) *echo.Echo {
 	e.Use(middleware.Recover())
 	e.HTTPErrorHandler = APIErrorHandler
 
-	db, err := sqlx.Open("pgx", config.DatabaseDSN())
+	// 接続を使う前の Ping を、Config.DBPingIdle を超えてアイドルだった接続だけにする（db_pool.go、#70）。
+	db, err := openDB(config)
 	if err != nil {
 		panic("failed to open database: " + err.Error())
 	}
 	// idle を MaxOpen と揃え、リージョンをまたぐ接続の作り直しを防ぐ。
+	// europe と america から asia2 への接続は作るのに約 840ms かかるので、既定ではアイドルや経過時間で閉じない（#70）。
 	// 全台の合計が PostgreSQL の max_connections (etc/postgresql/conf.d/isucon.conf) を超えないこと。
 	db.SetMaxOpenConns(config.DBMaxConns)
 	db.SetMaxIdleConns(config.DBMaxConns)
-	db.SetConnMaxLifetime(10 * time.Minute)
-	db.SetConnMaxIdleTime(5 * time.Minute)
+	db.SetConnMaxLifetime(config.DBConnMaxLifetime)
+	db.SetConnMaxIdleTime(config.DBConnMaxIdleTime)
 	err = db.Ping()
 	if err != nil {
 		panic("failed to ping database: " + err.Error())
 	}
+	// 起動を待たせずに、接続を DBWarmConns 本まで作っておく（#70）。
+	startDBPoolWarmup(db.DB, config.DBWarmConns)
 
 	handlerContext := &HandlerContext{
 		DB:     db,
