@@ -7,6 +7,7 @@ require (
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/jmoiron/sqlx v1.4.0
 	github.com/labstack/echo/v5 v5.3.1
+	golang.org/x/sys v0.49.0
 )
 
 require (

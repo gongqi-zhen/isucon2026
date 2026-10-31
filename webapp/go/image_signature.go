@@ -60,6 +60,18 @@ func signedImageURL(user User, imageID string) string {
 // signedImageURLAt は signedImageURL と同じ。createdAt（画像の行の created_at。投稿の画像なら posts.posted_at）が分かっていれば、
 // 所有者と一緒に覚えておき、キャッシュにない画像を読むときにパーティションを絞り込むのに使う（#101）。ゼロ値なら覚えない。
 func signedImageURLAt(user User, imageID string, createdAt time.Time) string {
+	owner := rememberImageOwner(user, imageID, createdAt)
+	exp, expText := currentImageURLExp()
+	entry, ok := signedURLCache.Get(signedURLCacheKey(user, imageID))
+	if !ok || entry.exp != exp {
+		entry = signedURLEntry{exp: exp, sig: base64.RawURLEncoding.EncodeToString(imageSignature(user.ImageKey, imageID, exp))}
+		storeSignedURL(user, imageID, owner, entry, expText)
+	}
+	return signedImageURLString(imageID, expText, entry.sig)
+}
+
+// rememberImageOwner は、user を imageID の所有者として imageOwnerKeyCache に覚え、覚えている所有者を返す。
+func rememberImageOwner(user User, imageID string, createdAt time.Time) imageOwner {
 	owner, ok := imageOwnerKeyCache.Get(imageID)
 	if user.SecretKeyHash != "" {
 		updated := owner
@@ -74,21 +86,28 @@ func signedImageURLAt(user User, imageID string, createdAt time.Time) string {
 			imageOwnerKeyCache.Add(imageID, owner, 1, time.Time{})
 		}
 	}
+	return owner
+}
+
+// currentImageURLExp は、今作る署名付き URL の exp（imageURLExpGranularity で切り捨て）とその文字列を返す。
+func currentImageURLExp() (int64, string) {
 	exp := time.Now().Add(imageURLLifetime).Unix()
 	exp -= exp % imageURLExpGranularity
-	expText := strconv.FormatInt(exp, 10)
-	cacheKey := string(user.ImageKey) + "\x00" + imageID
-	entry, ok := signedURLCache.Get(cacheKey)
-	if !ok || entry.exp != exp {
-		entry = signedURLEntry{exp: exp, sig: base64.RawURLEncoding.EncodeToString(imageSignature(user.ImageKey, imageID, exp))}
-		signedURLCache.Add(cacheKey, entry, 1, time.Time{})
-		// 取得の検証では、imageOwnerKeyCache の鍵で同じ計算をする。その鍵がこの user の鍵と同じなら、
-		// 検証の結果は必ず成功なので、先に検証済みとして覚えておき、取得のときに HMAC を計算し直さない。
-		if user.SecretKeyHash != "" && owner.SecretKeyHash == user.SecretKeyHash {
-			verifiedSignatureCache.Add(verifiedSignatureKey(imageID, expText, entry.sig), struct{}{}, 1, time.Unix(exp, 0))
-		}
+	return exp, strconv.FormatInt(exp, 10)
+}
+
+func signedURLCacheKey(user User, imageID string) string {
+	return string(user.ImageKey) + "\x00" + imageID
+}
+
+// storeSignedURL は、計算した署名を signedURLCache に入れる。owner は rememberImageOwner が返したもの。
+func storeSignedURL(user User, imageID string, owner imageOwner, entry signedURLEntry, expText string) {
+	signedURLCache.Add(signedURLCacheKey(user, imageID), entry, 1, time.Time{})
+	// 取得の検証では、imageOwnerKeyCache の鍵で同じ計算をする。その鍵がこの user の鍵と同じなら、
+	// 検証の結果は必ず成功なので、先に検証済みとして覚えておき、取得のときに HMAC を計算し直さない。
+	if user.SecretKeyHash != "" && owner.SecretKeyHash == user.SecretKeyHash {
+		verifiedSignatureCache.Add(verifiedSignatureKey(imageID, expText, entry.sig), struct{}{}, 1, time.Unix(entry.exp, 0))
 	}
-	return signedImageURLString(imageID, expText, entry.sig)
 }
 
 // signedImageURLString は署名付き URL の文字列を組み立てる。
