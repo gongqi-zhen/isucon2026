@@ -91,6 +91,12 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		defer tx.Rollback()
+		// 画像の送信は、リージョンをまたぐと時間がかかる。ほかの投稿と衝突するロックを取る前に済ませておく。
+		// 投稿が受け付けられなかった場合は、ロールバックで画像も消える。
+		imageID := uuid.NewString()
+		if _, err := tx.ExecContext(ctx, `INSERT INTO image_objects (id, owner_user_id, data, media_type) VALUES ($1, $2, $3, 'image/jpeg')`, imageID, userID, imageData); err != nil {
+			return err
+		}
 		lockedUser, err := lockUser(ctx, tx, userID)
 		if err != nil {
 			return err
@@ -104,9 +110,12 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 			LocalDate time.Time `db:"local_date"`
 			StartsAt  time.Time `db:"starts_at"`
 		}
-		err = tx.GetContext(ctx, &window, `SELECT id, local_date, starts_at FROM posting_windows WHERE region = $1 AND ended_at IS NULL FOR UPDATE`, user.Region)
+		// 投稿期間の行は FOR SHARE でロックする。同じリージョンの投稿どうしは並行して進み、
+		// 投稿期間の終了（UPDATE posting_windows）とは衝突するので、終了前に始まった投稿は終了より先に確定する。
+		// 終了と入れ違いになると、ロックを待ったあとの再評価で行が条件に合わなくなるので、新しい投稿期間を取り直す。
+		err = tx.GetContext(ctx, &window, `SELECT id, local_date, starts_at FROM posting_windows WHERE region = $1 AND ended_at IS NULL FOR SHARE`, user.Region)
 		if errors.Is(err, sql.ErrNoRows) {
-			err = tx.GetContext(ctx, &window, `SELECT id, local_date, starts_at FROM posting_windows WHERE region = $1 AND ended_at IS NULL FOR UPDATE`, user.Region)
+			err = tx.GetContext(ctx, &window, `SELECT id, local_date, starts_at FROM posting_windows WHERE region = $1 AND ended_at IS NULL FOR SHARE`, user.Region)
 		}
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -129,10 +138,6 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 		postedAt := time.Now().UTC()
 		if counts.Active != 0 || counts.Deleted >= 2 || postedAt.Before(window.StartsAt) {
 			return NewAPIError(http.StatusConflict, "post_slot_unavailable")
-		}
-		imageID := uuid.NewString()
-		if _, err := tx.ExecContext(ctx, `INSERT INTO image_objects (id, owner_user_id, data, media_type, created_at) VALUES ($1, $2, $3, 'image/jpeg', $4)`, imageID, userID, imageData, postedAt); err != nil {
-			return err
 		}
 		postID := uuid.NewString()
 		if _, err := tx.ExecContext(ctx, `

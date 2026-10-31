@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"errors"
 	"net/http"
-	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -50,7 +49,7 @@ func createCommentHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		defer tx.Rollback()
-		lockedUsers, err := lockUsers(ctx, tx, slices.Compact([]string{min(actor, post.AuthorID), max(actor, post.AuthorID)}))
+		lockedUsers, err := lockInteractionUsers(ctx, tx, actor, post.AuthorID)
 		if err != nil {
 			return err
 		}

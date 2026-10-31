@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/labstack/echo/v5"
 )
 
@@ -44,4 +45,10 @@ func APIErrorHandler(c *echo.Context, err error) {
 	if writeErr := c.JSON(status, body); writeErr != nil {
 		c.Logger().Error("failed to write error response", "error", writeErr)
 	}
+}
+
+// isUniqueViolation は、PostgreSQL の一意制約違反（23505）かどうかを返す。
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }

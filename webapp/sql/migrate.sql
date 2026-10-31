@@ -35,6 +35,8 @@ END $$;
 
 -- 001-schema.sql と同じインデックス（既存のDB向け）
 CREATE INDEX IF NOT EXISTS users_username_id ON users(username, id);
+-- 登録時のユーザー名の重複を、テーブルロックではなく一意制約で防ぐ（#25）。
+CREATE UNIQUE INDEX IF NOT EXISTS users_username_key ON users(username);
 CREATE INDEX IF NOT EXISTS users_search_text_null ON users(username, id) WHERE search_text IS NULL;
 CREATE INDEX IF NOT EXISTS login_sessions_token_hash_active ON login_sessions(token_hash) WHERE active = true;
 CREATE INDEX IF NOT EXISTS login_sessions_user_id_active ON login_sessions(user_id) WHERE active = true;
