@@ -38,11 +38,15 @@ for i in $(seq 1 24); do date +%T; curl -s 127.0.0.1:6060/debug/vars | jq -c '{d
 - 今の設定は asia1 = 24、europe1 = america1 = 40（各サーバの `~/env.sh`。合計 104）。asia1 はリクエストが europe1 の 12〜15 倍（#35）です。
 - asia1 で待ちが出ていれば、合計を増やさずに配分を変えます（例：asia1 = 40、europe1 = america1 = 32）。PostgreSQL の接続1本は約 12MB で、asia2 は OOM を起こしたことがあります（#16 のコメント）。全台の合計が `max_connections = 256` と asia2 のメモリに収まることを、asia2 の `free -m` で確かめます。
 - europe1 と america1 で `WaitCount` が 0 のままなら、その分を asia1 に回せます。
+- #125 で asia1 = 40、europe1 = america1 = 32 を試した結果（2026-10-31、走行1回ずつ）：3台の待ちの合計（`WaitDuration` の増分）は 7,052秒 から 4,237秒 に減ったが、スコアは 62,370 から 53,947 に下がったので、元に戻した。
+  - 待ちが減っても、スコアが上がるとは限りません。ピークのとき asia2 の CPU は空きが 0% で、asia1 の同時実行が増えると、PostgreSQL のロック待ちが増えます。europe1 の1回あたりの待ちは 98ms から 149ms に増えました。
+  - 配分を変えたら、待ちの値だけでなく、必ずスコアで比べます。
 
 ### 画像本体のキャッシュ（`ISUREAL_IMAGE_CACHE_BYTES`、既定 512MB）
 - `image_object.evictions` が走行の間に増え続けていれば、上限に当たっています。`misses` のうち追い出しが原因の分は、DB からリージョンをまたいで読み直しています（1枚 約450KB）。
-- asia1 は空きメモリ 約3GiB、`GOMEMLIMIT=2GiB` なので、1GiB まで増やせます。europe1 と america1 も同程度の空きがあります（`GOMEMLIMIT` は drop-in で 2600MiB）。
+- asia1 は `GOMEMLIMIT=2GiB` で、走行の後のアプリの RSS は約 2.0GB、空きメモリ（available）は約 1.2GiB（#125）。増やすなら `GOMEMLIMIT` も上げないと GC が増えます。europe1 と america1 は drop-in で 1.5GiB（`GOMEMLIMIT` は 2600MiB）。
 - `evictions` が 0 で `cost` が `max_cost` に届いていなければ、増やしても効果はありません。
+- 初期化でキャッシュは空になるので、走行の始めの `misses` は初めて読む画像の分です。上限を上げて減るのは、追い出した後に読み直す分だけです。
 
 ### 署名のキャッシュ（`signed_url`、`verified_signature`）
 - `misses` が多ければ、その回数だけ HMAC を 1,000 回計算しています（#71）。`evictions` が増えていれば上限（200,000 件）を増やします。
