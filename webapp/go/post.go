@@ -148,13 +148,22 @@ func loadViewerContext(ctx context.Context, db sqlx.QueryerContext, viewerID str
 		return viewer, err
 	}
 	viewer.HasPostedToday = row.HasPostedToday
+	if err := viewer.applyRelationLists(row.BlockedIDs, row.FriendIDs, row.FriendsOfFriendsIDs); err != nil {
+		return viewer, err
+	}
+	return viewer, nil
+}
+
+// applyRelationLists は、SQL で JSON の配列にしたブロック・友達・友達の友達の ID を viewer に入れる。
+// friendsOfFriendsJSON は「友達を片側に持つ友達関係」の反対側を、関係ごとに1件ずつ含むこと（MutualFriends の数に使う）。
+func (viewer *viewerContext) applyRelationLists(blockedJSON, friendsJSON, friendsOfFriendsJSON string) error {
 	var blocked, friends, friendsOfFriends []string
 	for _, list := range []struct {
 		raw string
 		ids *[]string
-	}{{row.BlockedIDs, &blocked}, {row.FriendIDs, &friends}, {row.FriendsOfFriendsIDs, &friendsOfFriends}} {
+	}{{blockedJSON, &blocked}, {friendsJSON, &friends}, {friendsOfFriendsJSON, &friendsOfFriends}} {
 		if err := json.Unmarshal([]byte(list.raw), list.ids); err != nil {
-			return viewer, err
+			return err
 		}
 	}
 	for _, id := range blocked {
@@ -170,7 +179,7 @@ func loadViewerContext(ctx context.Context, db sqlx.QueryerContext, viewerID str
 			viewer.MutualFriends[id]++
 		}
 	}
-	return viewer, nil
+	return nil
 }
 
 func (viewer viewerContext) canView(post Post) bool {
