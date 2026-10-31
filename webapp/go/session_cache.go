@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -206,6 +207,28 @@ type sessionCache struct {
 	evictedAt map[string]time.Time
 	start     sync.Once
 	now       func() time.Time
+	// 計測用のカウンタ（#108）。get の結果を数える。アトミックな加算だけなので、ロックは増えない。
+	hits   atomic.Int64
+	misses atomic.Int64
+}
+
+// sessionCacheStats は、/debug/vars 向けの状態と累計のカウンタ。
+type sessionCacheStats struct {
+	Enabled bool   `json:"enabled"`
+	Region  string `json:"region"`
+	Entries int    `json:"entries"`
+	Max     int    `json:"max"`
+	Hits    int64  `json:"hits"`
+	Misses  int64  `json:"misses"`
+}
+
+// stats は、/debug/vars 向けの状態と累計のカウンタを返す（#108）。
+func (c *sessionCache) stats() sessionCacheStats {
+	c.mu.Lock()
+	stats := sessionCacheStats{Enabled: c.enabled, Region: c.region, Entries: len(c.entries), Max: sessionCacheMax}
+	c.mu.Unlock()
+	stats.Hits, stats.Misses = c.hits.Load(), c.misses.Load()
+	return stats
 }
 
 // init は最初に使うときに1回だけ呼ばれ、リージョンを決めて、キャッシュするなら確かめ直しのループを始める。
@@ -236,13 +259,16 @@ func (c *sessionCache) get(tokenHash string) (*Session, bool) {
 	}
 	entry, ok := c.entries[tokenHash]
 	if !ok {
+		c.misses.Add(1)
 		return nil, false
 	}
 	now := c.now()
 	entry.lastUsedAt = now
 	if now.Sub(entry.validatedAt) > sessionCacheTTL {
+		c.misses.Add(1)
 		return nil, false
 	}
+	c.hits.Add(1)
 	session := entry.session
 	if session.User != nil {
 		user := *session.User

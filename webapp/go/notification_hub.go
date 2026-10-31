@@ -7,6 +7,7 @@ import (
 	"log"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -239,16 +240,18 @@ func newNotificationHub(source notificationSource) *NotificationHub {
 
 var (
 	notificationHubOnce sync.Once
-	notificationHub     *NotificationHub
+	// notificationHub はプロセスで1つのハブ。/debug/vars（metrics.go）が別の goroutine から読むので、アトミックに持つ。
+	notificationHub atomic.Pointer[NotificationHub]
 )
 
 func getNotificationHub(h *HandlerContext) *NotificationHub {
 	notificationHubOnce.Do(func() {
-		notificationHub = newNotificationHub(dbNotificationSource{db: h.DB})
-		go notificationHub.run(context.Background())
-		go notificationHub.listen(context.Background(), h.Config.DatabaseDSN())
+		hub := newNotificationHub(dbNotificationSource{db: h.DB})
+		notificationHub.Store(hub)
+		go hub.run(context.Background())
+		go hub.listen(context.Background(), h.Config.DatabaseDSN())
 	})
-	return notificationHub
+	return notificationHub.Load()
 }
 
 func (hub *NotificationHub) subscribe(userID, region string) *notificationWaiter {
@@ -305,6 +308,13 @@ func (hub *NotificationHub) run(ctx context.Context) {
 			hub.checkUsers(ctx)
 		}
 	}
+}
+
+// waiterCount は、待機中の接続の数を返す（/debug/vars 向け。#108）。
+func (hub *NotificationHub) waiterCount() int {
+	hub.mu.Lock()
+	defer hub.mu.Unlock()
+	return len(hub.waiters)
 }
 
 func (hub *NotificationHub) snapshot() []*notificationWaiter {
