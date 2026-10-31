@@ -3,6 +3,7 @@ package isureal
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -100,59 +101,73 @@ type viewerContext struct {
 	Blocked          map[string]bool
 }
 
+// viewerFriendsCTE は $1 の閲覧者の友達IDを viewer_friends として定義する。
+const viewerFriendsCTE = `viewer_friends AS (
+    SELECT CASE WHEN user_low_id = $1 THEN user_high_id ELSE user_low_id END AS id
+    FROM friendships WHERE user_low_id = $1 OR user_high_id = $1
+  )`
+
+type viewerContextRow struct {
+	User
+	HasPostedToday      bool   `db:"has_posted_today"`
+	BlockedIDs          string `db:"blocked_ids"`
+	FriendIDs           string `db:"friend_ids"`
+	FriendsOfFriendsIDs string `db:"friends_of_friends_ids"`
+}
+
+// loadViewerContext は閲覧者の情報を1回のクエリでまとめて取得する。
 func loadViewerContext(ctx context.Context, db sqlx.QueryerContext, viewerID string) (viewerContext, error) {
-	viewer := viewerContext{Friends: map[string]bool{}, FriendsOfFriends: map[string]bool{}, MutualFriends: map[string]int{}}
-	var err error
-	if viewer.User, err = getUser(ctx, db, viewerID); err != nil {
+	viewer := viewerContext{Friends: map[string]bool{}, FriendsOfFriends: map[string]bool{}, MutualFriends: map[string]int{}, Blocked: map[string]bool{}}
+	var row viewerContextRow
+	if err := sqlx.GetContext(ctx, db, &row, `
+  WITH `+viewerFriendsCTE+`
+  SELECT `+qualifiedUserColumns("u")+`,
+    EXISTS(
+      SELECT 1 FROM posts p
+      JOIN posting_windows posted ON posted.id = p.posting_window_id
+      JOIN posting_windows current ON current.region = u.region AND current.ended_at IS NULL
+                                  AND current.local_date = posted.local_date
+      WHERE p.author_id = u.id AND p.deleted_at IS NULL
+    ) AS has_posted_today,
+    to_json(ARRAY(
+      SELECT CASE WHEN blocker_id = $1 THEN blocked_id ELSE blocker_id END
+      FROM block_relations WHERE blocker_id = $1 OR blocked_id = $1
+    ))::text AS blocked_ids,
+    to_json(ARRAY(SELECT id FROM viewer_friends))::text AS friend_ids,
+    to_json(ARRAY(
+      SELECT f.user_high_id FROM friendships f WHERE f.user_low_id IN (SELECT id FROM viewer_friends)
+      UNION ALL
+      SELECT f.user_low_id FROM friendships f WHERE f.user_high_id IN (SELECT id FROM viewer_friends)
+    ))::text AS friends_of_friends_ids
+  FROM users u WHERE u.id = $1 AND u.status = 'active'
+ `, viewerID); err != nil {
 		return viewer, err
 	}
-	if err := sqlx.GetContext(ctx, db, &viewer.HasPostedToday, `
-  SELECT EXISTS(
-    SELECT 1 FROM posts p
-    JOIN posting_windows posted ON posted.id = p.posting_window_id
-    JOIN posting_windows current ON current.region = $2 AND current.ended_at IS NULL
-                                AND current.local_date = posted.local_date
-    WHERE p.author_id = $1 AND p.deleted_at IS NULL
-  )
- `, viewer.ID, viewer.Region); err != nil {
+	viewer.User = row.User
+	if err := viewer.User.setImageKey(); err != nil {
 		return viewer, err
 	}
-	if viewer.Blocked, err = getBlockedUserIDs(ctx, db, viewer.ID); err != nil {
-		return viewer, err
+	viewer.HasPostedToday = row.HasPostedToday
+	var blocked, friends, friendsOfFriends []string
+	for _, list := range []struct {
+		raw string
+		ids *[]string
+	}{{row.BlockedIDs, &blocked}, {row.FriendIDs, &friends}, {row.FriendsOfFriendsIDs, &friendsOfFriends}} {
+		if err := json.Unmarshal([]byte(list.raw), list.ids); err != nil {
+			return viewer, err
+		}
 	}
-	friends, err := getFriendIDs(ctx, db, viewer.ID)
-	if err != nil {
-		return viewer, err
-	}
-	if len(friends) == 0 {
-		return viewer, nil
+	for _, id := range blocked {
+		viewer.Blocked[id] = true
 	}
 	for _, id := range friends {
 		viewer.Friends[id] = true
 	}
-	query, args, err := sqlx.In(`SELECT user_low_id, user_high_id FROM friendships WHERE user_low_id IN (?) OR user_high_id IN (?)`, friends, friends)
-	if err != nil {
-		return viewer, err
-	}
-	var friendships []struct {
-		UserLowID  string `db:"user_low_id"`
-		UserHighID string `db:"user_high_id"`
-	}
-	if err := sqlx.SelectContext(ctx, db, &friendships, sqlx.Rebind(sqlx.DOLLAR, query), args...); err != nil {
-		return viewer, err
-	}
-	for _, friendship := range friendships {
-		if viewer.Friends[friendship.UserLowID] {
-			viewer.FriendsOfFriends[friendship.UserHighID] = true
-			if friendship.UserHighID != viewer.ID {
-				viewer.MutualFriends[friendship.UserHighID]++
-			}
-		}
-		if viewer.Friends[friendship.UserHighID] {
-			viewer.FriendsOfFriends[friendship.UserLowID] = true
-			if friendship.UserLowID != viewer.ID {
-				viewer.MutualFriends[friendship.UserLowID]++
-			}
+	// friends_of_friends_ids は「友達を片側に持つ友達関係」の反対側を、関係ごとに1件ずつ含む。
+	for _, id := range friendsOfFriends {
+		viewer.FriendsOfFriends[id] = true
+		if id != viewer.ID {
+			viewer.MutualFriends[id]++
 		}
 	}
 	return viewer, nil
@@ -177,22 +192,85 @@ func (viewer viewerContext) canView(post Post) bool {
 	}
 }
 
+// postAccess は1件の投稿と、その作者に対する閲覧者の関係をまとめたもの。
+type postAccess struct {
+	PostWithAuthor
+	ViewerActive         bool `db:"viewer_active"`
+	ViewerHasPostedToday bool `db:"viewer_has_posted_today"`
+	Blocked              bool `db:"blocked"`
+	Friend               bool `db:"friend"`
+	FriendOfFriend       bool `db:"friend_of_friend"`
+}
+
+// loadPostAccess は投稿と、権限判定に必要な閲覧者の情報を1回のクエリで取得する。
+// 投稿がない場合は sql.ErrNoRows を返す。
+func loadPostAccess(ctx context.Context, db sqlx.QueryerContext, viewerID, postID string) (postAccess, error) {
+	var access postAccess
+	err := sqlx.GetContext(ctx, db, &access, `
+  WITH viewer AS (SELECT id, region FROM users WHERE id = $1 AND status = 'active'),
+  `+viewerFriendsCTE+`
+  SELECT `+postColumns+`, `+userColumnsAs("u", "author")+`,
+    EXISTS(SELECT 1 FROM viewer) AS viewer_active,
+    EXISTS(
+      SELECT 1 FROM posts vp
+      JOIN viewer ON viewer.id = vp.author_id
+      JOIN posting_windows posted ON posted.id = vp.posting_window_id
+      JOIN posting_windows current ON current.region = viewer.region AND current.ended_at IS NULL
+                                  AND current.local_date = posted.local_date
+      WHERE vp.deleted_at IS NULL
+    ) AS viewer_has_posted_today,
+    EXISTS(
+      SELECT 1 FROM block_relations b
+      WHERE (b.blocker_id = $1 AND b.blocked_id = p.author_id) OR (b.blocker_id = p.author_id AND b.blocked_id = $1)
+    ) AS blocked,
+    EXISTS(SELECT 1 FROM viewer_friends vf WHERE vf.id = p.author_id) AS friend,
+    EXISTS(
+      SELECT 1 FROM friendships af JOIN viewer_friends vf
+        ON (af.user_low_id = vf.id AND af.user_high_id = p.author_id)
+        OR (af.user_high_id = vf.id AND af.user_low_id = p.author_id)
+    ) AS friend_of_friend
+  FROM posts p
+  JOIN posting_windows w ON w.id = p.posting_window_id
+  JOIN users u ON u.id = p.author_id AND u.status = 'active'
+  WHERE p.deleted_at IS NULL AND p.id = $2
+ `, viewerID, postID)
+	if err != nil {
+		return access, err
+	}
+	return access, access.Author.setImageKey()
+}
+
+// viewer は loadViewerContext と同じ判定結果になるよう、この投稿の作者の分だけを持つ viewerContext を返す。
+func (access postAccess) viewer(viewerID string) viewerContext {
+	viewer := viewerContext{
+		User: User{ID: viewerID}, HasPostedToday: access.ViewerHasPostedToday,
+		Friends: map[string]bool{}, FriendsOfFriends: map[string]bool{}, MutualFriends: map[string]int{}, Blocked: map[string]bool{},
+	}
+	if access.Blocked {
+		viewer.Blocked[access.AuthorID] = true
+	}
+	if access.Friend {
+		viewer.Friends[access.AuthorID] = true
+	}
+	if access.FriendOfFriend {
+		viewer.FriendsOfFriends[access.AuthorID] = true
+	}
+	return viewer
+}
+
+func (access postAccess) canView(viewerID string) bool {
+	return access.ViewerActive && access.viewer(viewerID).canView(access.Post)
+}
+
 func canViewPost(ctx context.Context, db sqlx.QueryerContext, viewerID, postID string) (bool, error) {
-	post, err := getPostWithAuthor(ctx, db, postID)
+	access, err := loadPostAccess(ctx, db, viewerID, postID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	viewer, err := loadViewerContext(ctx, db, viewerID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return viewer.canView(post.Post), nil
+	return access.canView(viewerID), nil
 }
 
 func getFriendIDs(ctx context.Context, db sqlx.QueryerContext, userID string) ([]string, error) {

@@ -33,33 +33,24 @@ func createFriendRequestHandler(h *HandlerContext) echo.HandlerFunc {
 			return err
 		}
 		defer tx.Rollback()
-		blocked, err := isBlocked(ctx, tx, actor, input.RecipientID)
-		if err != nil {
+		// ブロック関係と友達関係を1回のクエリで確認する。
+		var conflict bool
+		if err := tx.GetContext(ctx, &conflict, `
+   SELECT EXISTS(SELECT 1 FROM block_relations WHERE (blocker_id=$1 AND blocked_id=$2) OR (blocker_id=$2 AND blocked_id=$1))
+       OR EXISTS(SELECT 1 FROM friendships WHERE (user_low_id=$1 AND user_high_id=$2) OR (user_low_id=$2 AND user_high_id=$1))
+  `, actor, input.RecipientID); err != nil {
 			return err
 		}
-		if blocked {
+		if conflict {
 			return NewAPIError(http.StatusConflict, "relationship_conflict")
 		}
-		friends, err := getFriendIDs(ctx, tx, actor)
-		if err != nil {
-			return err
-		}
-		for _, id := range friends {
-			if id == input.RecipientID {
-				return NewAPIError(http.StatusConflict, "relationship_conflict")
-			}
-		}
-		var existingID string
-		err = tx.GetContext(ctx, &existingID, `
-   SELECT id FROM friend_requests WHERE status='pending' AND
+		var request FriendRequest
+		err = tx.GetContext(ctx, &request, `
+   SELECT id, requester_id, recipient_id, status, created_at, updated_at FROM friend_requests WHERE status='pending' AND
     ((requester_id=$1 AND recipient_id=$2) OR (requester_id=$2 AND recipient_id=$1))
   `, actor, input.RecipientID)
 		var requestID string
 		if err == nil {
-			request, err := getFriendRequest(ctx, tx, existingID)
-			if err != nil {
-				return err
-			}
 			if request.RequesterID == actor {
 				return NewAPIError(http.StatusConflict, "relationship_conflict")
 			}
@@ -78,7 +69,7 @@ func createFriendRequestHandler(h *HandlerContext) echo.HandlerFunc {
 		} else {
 			return err
 		}
-		request, err := getFriendRequest(ctx, tx, requestID)
+		request, err = getFriendRequest(ctx, tx, requestID)
 		if err != nil {
 			return err
 		}

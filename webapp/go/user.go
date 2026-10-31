@@ -2,6 +2,7 @@ package isureal
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"regexp"
 	"strings"
@@ -47,6 +48,49 @@ func userColumnsAs(alias, prefix string) string {
 		columns[i] = fmt.Sprintf(`%s.%s AS "%s.%s"`, alias, column, prefix, column)
 	}
 	return strings.Join(columns, ", ")
+}
+
+func qualifiedUserColumns(alias string) string {
+	columns := make([]string, len(userColumns))
+	for i, column := range userColumns {
+		columns[i] = alias + "." + column
+	}
+	return strings.Join(columns, ", ")
+}
+
+// lockUser は users の行を FOR NO KEY UPDATE でロックし、同時にその行を返す。
+// status による絞り込みはしないので、active であるかは呼び出し側で activeUser を使って確認する。
+func lockUser(ctx context.Context, tx *sqlx.Tx, userID string) (User, error) {
+	var user User
+	err := tx.GetContext(ctx, &user, `SELECT `+strings.Join(userColumns, ", ")+` FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID)
+	return user, err
+}
+
+// lockUsers は複数の users の行を id の昇順（Go の文字列比較と同じバイト順）に FOR NO KEY UPDATE でロックし、id ごとの行を返す。
+// どれか1件でも見つからなければ sql.ErrNoRows を返す。status による絞り込みはしない。
+func lockUsers(ctx context.Context, tx *sqlx.Tx, userIDs []string) (map[string]User, error) {
+	var users []User
+	if err := tx.SelectContext(ctx, &users, `SELECT `+strings.Join(userColumns, ", ")+` FROM users WHERE id = ANY($1::text[]) ORDER BY id COLLATE "C" FOR NO KEY UPDATE`, userIDs); err != nil {
+		return nil, err
+	}
+	locked := make(map[string]User, len(users))
+	for _, user := range users {
+		locked[user.ID] = user
+	}
+	for _, id := range userIDs {
+		if _, ok := locked[id]; !ok {
+			return nil, sql.ErrNoRows
+		}
+	}
+	return locked, nil
+}
+
+// activeUser は getUser と同じく、active でなければ sql.ErrNoRows を返し、画像署名の鍵を設定する。
+func activeUser(user User) (User, error) {
+	if user.Status != "active" {
+		return user, sql.ErrNoRows
+	}
+	return user, user.setImageKey()
 }
 
 func (user *User) setImageKey() error {
