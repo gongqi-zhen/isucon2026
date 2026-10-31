@@ -52,6 +52,13 @@ CREATE INDEX IF NOT EXISTS realmojis_image_id ON realmojis(image_id);
 CREATE INDEX IF NOT EXISTS comments_post_id_created_at ON comments(post_id, created_at, id) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS notifications_user_id_created_at ON notifications(user_id, created_at, id);
 
+-- Memories（listMemories）の RealMoji を、表を読まずに索引だけで読む（#120）。
+-- realmojis_post_id では、投稿ごとに表のばらばらのページを読んでいた。この索引では、1つの投稿の行が隣り合い、
+-- 並び順（created_at DESC, id DESC）もそのままなので、投稿ごとに索引のページを1枚読めば済む。
+-- 初回の作成は数秒かかる。初期化の中で作らないよう、反映の前に asia2 で手動で作っておく（IF NOT EXISTS で飛ばされる）。
+CREATE INDEX IF NOT EXISTS realmojis_post_active_cover ON realmojis(post_id, created_at DESC, id DESC)
+  INCLUDE (reactor_id, reaction_type, image_id) WHERE replaced_at IS NULL AND deleted_at IS NULL;
+
 -- 初期化（reset.sql）で「初期データより後に追加された行」を消すときに使う（#41）。
 -- created_at は追記順に増えるので、挿入時のインデックス更新は右端への追記で済む。
 CREATE INDEX IF NOT EXISTS notifications_created_at ON notifications(created_at);
