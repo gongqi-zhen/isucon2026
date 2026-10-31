@@ -3,6 +3,8 @@ package isureal
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
@@ -263,12 +265,21 @@ func TestImageValidityDBQueriesMatchLegacy(t *testing.T) {
 					t.Errorf("%s (owner %q): checkImageValidity = %v, legacy = %v", id, ownerID, valid, legacy)
 				}
 			}
-			row, err := loadValidImageObject(ctx, env.db, id)
-			if (err == nil) != legacy {
-				t.Errorf("%s: loadValidImageObject err = %v, legacy = %v", id, err, legacy)
+			// created_at が分からない、正しい、違う（id だけで引き直す）のどれでも、結果は同じ（#101）。
+			// 行を消した画像（s.rows）は created_at がないので、適当な時刻で試す。
+			createdAt := time.Now()
+			if err := env.db.Get(&createdAt, `SELECT created_at FROM image_objects WHERE id = $1`, id); err != nil && !errors.Is(err, sql.ErrNoRows) {
+				t.Fatal(err)
 			}
-			if err == nil && (len(row.Data) == 0 || row.MediaType != "image/jpeg" || row.OwnerID != owner) {
-				t.Errorf("%s: loaded = %d bytes %q owner %q", id, len(row.Data), row.MediaType, row.OwnerID)
+			wrong := createdAt.Add(-24 * time.Hour)
+			for _, at := range []*time.Time{nil, &createdAt, &wrong} {
+				row, err := loadValidImageObject(ctx, env.db, id, at)
+				if (err == nil) != legacy {
+					t.Errorf("%s (created_at %v): loadValidImageObject err = %v, legacy = %v", id, at, err, legacy)
+				}
+				if err == nil && (len(row.Data) == 0 || row.MediaType != "image/jpeg" || row.OwnerID != owner) {
+					t.Errorf("%s (created_at %v): loaded = %d bytes %q owner %q", id, at, len(row.Data), row.MediaType, row.OwnerID)
+				}
 			}
 		}
 	}

@@ -78,23 +78,28 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 
 		// 削除状態は、無効化の一括検知（image_validity.go）か、imageValidityTTL より古くない確認の結果で判断する。
 		// どちらも、削除の5秒後には有効とみなさない。確認の結果は、クエリを送る前の時刻から数える。
+		// DB を引くときは、同じ画像の同時のリクエストを1回のクエリにまとめる（loadImageShared、#101）。
 		object, cached := imageObjectCache.Get(input.ImageID)
 		if cached {
 			if !imageKnownValid(input.ImageID) {
 				owner, _ := imageOwnerKeyCache.Get(input.ImageID)
-				sentAt := time.Now()
-				row, valid, err := checkImageValidity(ctx, h.DB, input.ImageID, owner.OwnerID)
+				check, sentAt, err := loadImageShared(ctx, &imageValidityLoads, input.ImageID, func(ctx context.Context) (imageValidityCheck, error) {
+					row, valid, err := checkImageValidity(ctx, h.DB, input.ImageID, owner.OwnerID)
+					return imageValidityCheck{row: row, valid: valid}, err
+				})
 				if err != nil {
 					return err
 				}
-				if !valid {
+				if !check.valid {
 					return NewAPIError(http.StatusForbidden, "image_forbidden")
 				}
-				markImageValid(input.ImageID, row.meta(), sentAt)
+				markImageValid(input.ImageID, check.row.meta(), sentAt)
 			}
 		} else {
-			sentAt := time.Now()
-			row, err := loadValidImageObject(ctx, h.DB, input.ImageID)
+			owner, _ := imageOwnerKeyCache.Get(input.ImageID)
+			row, sentAt, err := loadImageShared(ctx, &imageObjectLoads, input.ImageID, func(ctx context.Context) (imageObjectValidityRow, error) {
+				return loadValidImageObject(ctx, h.DB, input.ImageID, owner.createdAtArg())
+			})
 			if errors.Is(err, sql.ErrNoRows) {
 				return NewAPIError(http.StatusForbidden, "image_forbidden")
 			}
@@ -112,10 +117,16 @@ func getImageHandler(h *HandlerContext) echo.HandlerFunc {
 	}
 }
 
-// 所有者が active な画像について、所有者の id と secret_key_hash を取得してキャッシュする。
+// imageValidityCheck は checkImageValidity の結果（loadImageShared でまとめて受け取るため）。
+type imageValidityCheck struct {
+	row   imageValidityRow
+	valid bool
+}
+
+// 所有者が active な画像について、所有者の id と secret_key_hash と、画像の行の created_at を取得してキャッシュする。
 func loadImageOwnerKey(ctx context.Context, h *HandlerContext, imageID string, owner *imageOwner) (bool, error) {
 	err := h.DB.GetContext(ctx, owner, `
-   SELECT u.id AS owner_id, u.secret_key_hash
+   SELECT u.id AS owner_id, u.secret_key_hash, i.created_at
    FROM image_objects i JOIN users u ON u.id = i.owner_user_id
    WHERE i.id = $1 AND u.status = 'active'
   `, imageID)
