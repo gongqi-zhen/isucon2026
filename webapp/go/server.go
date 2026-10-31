@@ -18,6 +18,16 @@ type HandlerContext struct {
 	DB     *sqlx.DB
 	Config *Config
 	IPBans *IPBanList
+	// SessionCacheDB は、セッションキャッシュの確かめ直し専用のプール（#121）。nil なら DB を使う。
+	SessionCacheDB *sqlx.DB
+}
+
+// sessionCacheDB は、セッションキャッシュの確かめ直しに使うプールを返す。
+func (h *HandlerContext) sessionCacheDB() *sqlx.DB {
+	if h.SessionCacheDB != nil {
+		return h.SessionCacheDB
+	}
+	return h.DB
 }
 
 func NewServer(config *Config) *echo.Echo {
@@ -54,6 +64,8 @@ func NewServer(config *Config) *echo.Echo {
 		DB:     db,
 		Config: config,
 		IPBans: NewIPBanList(db),
+		// キャッシュするリージョン（europe と america）では、確かめ直しに専用の接続を使う（#121）。
+		SessionCacheDB: openSessionCacheDB(config, db),
 	}
 	handlerContext.IPBans.Start(context.Background())
 	e.Use(IPBanMiddleware(handlerContext))

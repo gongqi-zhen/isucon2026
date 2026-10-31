@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -28,7 +29,16 @@ import (
 var (
 	sessionTestServerOnce sync.Once
 	sessionTestServer     *httptest.Server
+	// sessionTestClient は、並行して読むテストでも接続を使い回す（既定の http.DefaultClient はホストごとに2本しか残さず、
+	// 読み終えずに閉じた応答の接続も捨てるので、macOS ではローカルのポートを使い切って dial に失敗していた）。
+	sessionTestClient = &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: 64}}
 )
+
+// drainAndClose は、接続を使い回せるように応答を読み切ってから閉じる。
+func drainAndClose(res *http.Response) {
+	_, _ = io.Copy(io.Discard, res.Body)
+	res.Body.Close()
+}
 
 type sessionTestEnv struct {
 	t      *testing.T
@@ -80,11 +90,11 @@ func (env *sessionTestEnv) do(method, path, token string, body any) (int, map[st
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := sessionTestClient.Do(req)
 	if err != nil {
 		env.t.Fatal(err)
 	}
-	defer res.Body.Close()
+	defer drainAndClose(res)
 	var decoded map[string]any
 	_ = json.NewDecoder(res.Body).Decode(&decoded)
 	return res.StatusCode, decoded
@@ -181,11 +191,11 @@ func TestSessionCacheDBConcurrentReadersDoNotResurrect(t *testing.T) {
 					req, _ := http.NewRequest("GET", env.server.URL+"/api/me", nil)
 					req.Header.Set("Authorization", "Bearer "+token)
 					req.Header.Set("X-Client-IP", "10.38.0.2")
-					res, err := http.DefaultClient.Do(req)
+					res, err := sessionTestClient.Do(req)
 					if err != nil {
 						continue
 					}
-					res.Body.Close()
+					drainAndClose(res)
 					if checkAfter && res.StatusCode == http.StatusOK {
 						bad.Add(1)
 					}

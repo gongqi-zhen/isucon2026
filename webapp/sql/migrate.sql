@@ -52,6 +52,13 @@ CREATE INDEX IF NOT EXISTS realmojis_image_id ON realmojis(image_id);
 CREATE INDEX IF NOT EXISTS comments_post_id_created_at ON comments(post_id, created_at, id) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS notifications_user_id_created_at ON notifications(user_id, created_at, id);
 
+-- Memories（listMemories）の RealMoji を、表を読まずに索引だけで読む（#120）。
+-- realmojis_post_id では、投稿ごとに表のばらばらのページを読んでいた。この索引では、1つの投稿の行が隣り合い、
+-- 並び順（created_at DESC, id DESC）もそのままなので、投稿ごとに索引のページを1枚読めば済む。
+-- 初回の作成は数秒かかる。初期化の中で作らないよう、反映の前に asia2 で手動で作っておく（IF NOT EXISTS で飛ばされる）。
+CREATE INDEX IF NOT EXISTS realmojis_post_active_cover ON realmojis(post_id, created_at DESC, id DESC)
+  INCLUDE (reactor_id, reaction_type, image_id) WHERE replaced_at IS NULL AND deleted_at IS NULL;
+
 -- 初期化（reset.sql）で「初期データより後に追加された行」を消すときに使う（#41）。
 -- created_at は追記順に増えるので、挿入時のインデックス更新は右端への追記で済む。
 CREATE INDEX IF NOT EXISTS notifications_created_at ON notifications(created_at);
@@ -69,6 +76,25 @@ CREATE INDEX IF NOT EXISTS posts_created_at ON posts(created_at);
 ALTER TABLE notifications DROP CONSTRAINT IF EXISTS notifications_user_id_fkey;
 ALTER TABLE notifications DROP CONSTRAINT IF EXISTS notifications_posting_window_id_fkey;
 ALTER TABLE notifications DROP CONSTRAINT IF EXISTS notifications_user_id_posting_window_id_key;
+
+-- 画像本体（平均 約370KB の JPEG）を、TOAST で圧縮しようとしない（#119）。
+-- 既定の extended では INSERT のたびに pglz で圧縮を試すが、JPEG は縮まないので必ず失敗し、非圧縮で保存される。
+-- external にしても保存される中身と読み出しの結果は同じで、圧縮の試行（1枚 約3.9ms の CPU）だけがなくなる。
+-- 親に対する ALTER は、今あるパーティションにも反映され、PARTITION OF で作るパーティションにも引き継がれる。
+-- 既存の行は書き換えない。反映済みのときは ALTER（とそのロック）を省き、初期化のたびにロックを取らない。
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_attribute a
+    WHERE a.attname = 'data' AND a.attstorage <> 'e'
+      AND a.attrelid IN (
+        SELECT 'image_objects'::regclass
+        UNION ALL SELECT inhrelid FROM pg_inherits WHERE inhparent = 'image_objects'::regclass
+      )
+  ) THEN
+    ALTER TABLE image_objects ALTER COLUMN data SET STORAGE EXTERNAL;
+  END IF;
+END $$;
 
 -- 利用者の退会・リージョンの変更・行の削除を、SSE で待っている接続を持つ各プロセスに pg_notify で知らせる（#110）。
 -- 以前は各プロセスが 500ms ごとに、待機中の全接続の利用者を users から引き直していた（notification_hub.go の checkUsers）。

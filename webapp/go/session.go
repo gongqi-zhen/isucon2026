@@ -58,7 +58,7 @@ func getSessionFromHeader(c *echo.Context, h *HandlerContext) (*Session, error) 
 
 	tokenHashBytes := sha256.Sum256([]byte(token))
 	tokenHash := hex.EncodeToString(tokenHashBytes[:])
-	sessions.init(h.Config.Region, dbSessionCacheSource{db: h.DB})
+	sessions.init(h.Config.Region, dbSessionCacheSource{db: h.sessionCacheDB()})
 	if cached, ok := sessions.get(tokenHash); ok {
 		return cached, nil
 	}

@@ -158,11 +158,11 @@ func TestSessionCacheSoleDBConcurrentReadersDoNotResurrect(t *testing.T) {
 					req, _ := http.NewRequest("GET", env.server.URL+"/api/me", nil)
 					req.Header.Set("Authorization", "Bearer "+token)
 					req.Header.Set("X-Client-IP", "10.62.0.1")
-					res, err := http.DefaultClient.Do(req)
+					res, err := sessionTestClient.Do(req)
 					if err != nil {
 						continue
 					}
-					res.Body.Close()
+					drainAndClose(res)
 					if res.StatusCode == http.StatusOK {
 						if checkAfter {
 							bad.Add(1)
