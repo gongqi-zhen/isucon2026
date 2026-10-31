@@ -1,6 +1,7 @@
 package isureal
 
 import (
+	"context"
 	"log"
 	"net/http"
 	_ "net/http/pprof"
@@ -49,8 +50,9 @@ func NewServer(config *Config) *echo.Echo {
 	handlerContext := &HandlerContext{
 		DB:     db,
 		Config: config,
-		IPBans: &IPBanList{},
+		IPBans: NewIPBanList(db),
 	}
+	handlerContext.IPBans.Start(context.Background())
 	e.Use(IPBanMiddleware(handlerContext))
 
 	if config.PprofAddr != "off" {
