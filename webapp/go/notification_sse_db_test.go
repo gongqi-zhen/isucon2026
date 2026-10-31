@@ -281,7 +281,7 @@ func TestNotificationListenerWakesHub(t *testing.T) {
 	// LISTEN している接続を DB 側から切っても、つなぎ直して届けること。
 	// 投稿期間を開いたときの知らせが残っているので、先に捨てる。
 	signaled(probe)
-	if _, err := env.db.Exec(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE query = $1`, "LISTEN "+postingWindowNotifyChannel); err != nil {
+	if _, err := env.db.Exec(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE query = $1`, notificationListenStatement); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -342,5 +342,72 @@ func TestPostingWindowOpenSendsNotifyOnCommit(t *testing.T) {
 	}
 	if payload, ok := wait(300 * time.Millisecond); ok {
 		t.Fatalf("rolled back open must not notify, got %q", payload)
+	}
+}
+
+// #110：利用者の退会・リージョンの変更が、migrate.sql のトリガの pg_notify で LISTEN に届き、その利用者の接続だけが閉じること。
+// ポーリングは実質止めておく。
+func TestNotificationUserChangeListener(t *testing.T) {
+	env := newLockTestEnv(t)
+	dsn := os.Getenv("ISUREAL_TEST_DSN")
+	hub := newNotificationHub(dbNotificationSource{db: env.db})
+	hub.windowPollInterval = time.Hour
+	hub.userCheckInterval = time.Hour
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go hub.run(ctx)
+	probe := hub.subscribe("probe", "asia")
+	go hub.listen(ctx, dsn)
+	select {
+	case <-probe.changed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("listener did not start")
+	}
+
+	moving, leaving, renamed, deletedBySQL, rolledBack := env.user("asia"), env.user("asia"), env.user("asia"), env.user("asia"), env.user("asia")
+	waiters := map[string]*notificationWaiter{}
+	for _, u := range []lockTestUser{moving, leaving, renamed, deletedBySQL, rolledBack} {
+		waiters[u.id] = hub.subscribe(u.id, "asia")
+	}
+	expectGone := func(u lockTestUser, what string) {
+		t.Helper()
+		select {
+		case <-waiters[u.id].gone:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s: connection was not closed by LISTEN/NOTIFY", what)
+		}
+	}
+
+	// リージョンの変更（PATCH /api/me は、アプリのトランザクションの中の UPDATE users）。
+	if status, body := env.do("PATCH", "/api/me", moving.token, map[string]any{"region": "europe"}, nil); status != http.StatusOK {
+		t.Fatalf("change region: %d %v", status, body)
+	}
+	expectGone(moving, "region change")
+
+	// 退会（isureal_delete_account の UPDATE users SET status = 'deleted'）。
+	if status, body := env.do("POST", "/api/me/account-deletion", leaving.token, nil, nil); status != http.StatusNoContent {
+		t.Fatalf("delete account: %d %v", status, body)
+	}
+	expectGone(leaving, "account deletion")
+
+	// SQL で直接 status を変えても届く（トリガなので、経路を問わない）。
+	env.db.MustExec(`UPDATE users SET status = 'deleted', updated_at = clock_timestamp() WHERE id = $1`, deletedBySQL.id)
+	expectGone(deletedBySQL, "status change by SQL")
+
+	// ロールバックした変更では届かない。表示名の変更（status と region は変わらない）でも閉じない。
+	tx := env.db.MustBegin()
+	tx.MustExec(`UPDATE users SET status = 'deleted' WHERE id = $1`, rolledBack.id)
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if status, body := env.do("PATCH", "/api/me", renamed.token, map[string]any{"displayName": "renamed"}, nil); status != http.StatusOK {
+		t.Fatalf("rename: %d %v", status, body)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if isGone(waiters[rolledBack.id]) {
+		t.Fatal("a rolled back change must not close the connection")
+	}
+	if isGone(waiters[renamed.id]) {
+		t.Fatal("a change that keeps status and region must not close the connection")
 	}
 }

@@ -56,12 +56,21 @@ import (
 // 行と validatedAt は必ず同じクエリの結果で一緒に進めるので、約束1は利用者の行にもそのまま当てはまる。
 // 約束2と3も同じで、利用者の行を変える操作（プロフィールの変更、プロフィール画像の設定と削除、退会、管理者による認定、初期化）は、
 // コミットしてから waitSessionInvalidation（または resetSessionCache）を呼んで応答する。
+//
+// 確かめ直しの対象の絞り込み（#110）：確かめ直しのクエリは、持っている全トークンを unnest で渡し、トークンごとに
+// login_sessions と users の索引を引いて行の md5 を計算する。エントリは走行の間ずっと残る（sessionCacheMax まで）ので、
+// 使われなくなった利用者の分も 100ms ごとに確かめ続け、DB の負荷がトークンの数に比例して増えていた。
+// そこで、エントリに最後に get で使った時刻（lastUsedAt）を持ち、sessionCacheIdle を超えて使われていないエントリは、
+// 確かめ直しの対象から外して消す（checks）。次にそのトークンが使われたときは DB を引き直し（1往復）、put で入り直す。
+// 約束1〜3はそのまま成り立つ。消すだけで、validatedAt を進めない結果を使うことはなく、消したエントリの判定は DB に戻るだけである。
 
 var (
 	sessionCacheRegions  = parseSessionCacheRegions(envOrDefault("ISUREAL_SESSION_CACHE_REGIONS", "europe,america"))
 	sessionCacheTTL      = time.Duration(envInt64("ISUREAL_SESSION_CACHE_TTL_MS", 400)) * time.Millisecond
 	sessionCacheInterval = time.Duration(envInt64("ISUREAL_SESSION_CACHE_INTERVAL_MS", 100)) * time.Millisecond
 	sessionCacheMax      = int(envInt64("ISUREAL_SESSION_CACHE_MAX", 100000))
+	// 最後に使ってからこれを超えたエントリは、確かめ直さずに消す（#110）。空や 0 以下は既定値。
+	sessionCacheIdle = time.Duration(envInt64("ISUREAL_SESSION_CACHE_IDLE_MS", 5000)) * time.Millisecond
 	// このプロセスのリージョンをキャッシュするのは、このプロセスだけであることを示す（#62）。
 	// 同じリージョンのアプリを2つ以上動かすとき（asia2 のアプリを動かす docs/asia-role-split.md の構成）は、どのプロセスにも設定しないこと。
 	sessionCacheSole = parseSessionCacheSole(os.Getenv("ISUREAL_SESSION_CACHE_SOLE"))
@@ -119,6 +128,8 @@ type sessionCacheEntry struct {
 	// session.User は、validatedAt に送ったクエリで読んだ利用者の行（#58）。nil なら GET /api/me は DB を引く。
 	session     Session
 	validatedAt time.Time
+	// lastUsedAt は、最後に get で引かれた（または put で入った）時刻。sessionCacheIdle を超えると確かめ直さずに消す（#110）。
+	lastUsedAt time.Time
 }
 
 // sessionUserFingerprint は、users u の行の md5。確かめ直しで、変わった利用者の行だけを返してもらうのに使う。
@@ -215,7 +226,8 @@ func (c *sessionCache) init(region string, source sessionCacheSource) {
 	})
 }
 
-// get は、TTL 以内に有効と確かめたセッションを返す。
+// get は、TTL 以内に有効と確かめたセッションを返す。引いたエントリは、TTL を過ぎていても「使われた」とみなす
+// （この後に DB を引いた結果が put で入り直すため）。
 func (c *sessionCache) get(tokenHash string) (*Session, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -223,7 +235,12 @@ func (c *sessionCache) get(tokenHash string) (*Session, bool) {
 		return nil, false
 	}
 	entry, ok := c.entries[tokenHash]
-	if !ok || c.now().Sub(entry.validatedAt) > sessionCacheTTL {
+	if !ok {
+		return nil, false
+	}
+	now := c.now()
+	entry.lastUsedAt = now
+	if now.Sub(entry.validatedAt) > sessionCacheTTL {
 		return nil, false
 	}
 	session := entry.session
@@ -246,10 +263,12 @@ func (c *sessionCache) put(session Session, sentAt time.Time) {
 	if !c.enabled || session.Region != c.region {
 		return
 	}
-	if c.now().Sub(sentAt) > sessionCacheTTL || c.sentBeforeEviction(session.UserID, sentAt) {
+	now := c.now()
+	if now.Sub(sentAt) > sessionCacheTTL || c.sentBeforeEviction(session.UserID, sentAt) {
 		return
 	}
 	if entry, ok := c.entries[session.TokenHash]; ok {
+		entry.lastUsedAt = now
 		if sentAt.After(entry.validatedAt) {
 			// 利用者の行も同じクエリの結果に置き換える（行がなければ、古い行を残さずに捨てる）。
 			entry.session.User, entry.session.userFingerprint = session.User, session.userFingerprint
@@ -261,7 +280,7 @@ func (c *sessionCache) put(session Session, sentAt time.Time) {
 		return
 	}
 	session.Token = ""
-	c.entries[session.TokenHash] = &sessionCacheEntry{session: session, validatedAt: sentAt}
+	c.entries[session.TokenHash] = &sessionCacheEntry{session: session, validatedAt: sentAt, lastUsedAt: now}
 }
 
 // evictUser は、その利用者のエントリを消し、消した時刻を覚える。セッションを無効にした書き込みのコミットの後に呼ぶこと。
@@ -327,11 +346,22 @@ func (c *sessionCache) tokenHashes() []string {
 	return hashes
 }
 
+// checks は、確かめ直すトークンを返す。sessionCacheIdle を超えて使われていないエントリは、確かめ直さずに消す（#110）。
 func (c *sessionCache) checks() []sessionCacheCheck {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	now := c.now()
 	checks := make([]sessionCacheCheck, 0, len(c.entries))
 	for tokenHash, entry := range c.entries {
+		lastUsedAt := entry.lastUsedAt
+		if lastUsedAt.IsZero() {
+			// 使った時刻を持たないエントリは、確かめた時刻を使った時刻とみなす。
+			lastUsedAt = entry.validatedAt
+		}
+		if now.Sub(lastUsedAt) > sessionCacheIdle {
+			delete(c.entries, tokenHash)
+			continue
+		}
 		fingerprint := entry.session.userFingerprint
 		if entry.session.User == nil {
 			fingerprint = ""
@@ -341,7 +371,7 @@ func (c *sessionCache) checks() []sessionCacheCheck {
 	return checks
 }
 
-// revalidate は、持っている全トークンを1クエリで確かめ直す。
+// revalidate は、持っているトークン（sessionCacheIdle 以内に使われたもの）を1クエリで確かめ直す。
 // 有効なものは validatedAt を送った時刻に進め、無効なものは消す。
 // その利用者を消した時刻より前に送ったクエリでは、有効でも validatedAt を進めない（約束3）。
 // 利用者の行は、validatedAt と一緒に、同じクエリの結果に合わせる（#58）。
