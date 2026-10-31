@@ -1,0 +1,25 @@
+# OS / Editor files
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# Build artifacts and binaries
+webapp/go/isureal
+webapp/go/cmd/isureal/isureal
+webapp/rust/isureal
+webapp/rust/target/
+webapp/nodejs/node_modules/
+webapp/ruby/vendor/
+webapp/python/.venv/
+webapp/python/__pycache__/
+webapp/python/*/__pycache__/
+webapp/python/*.pyc
+*.o
+*.a
+*.so
+
+# Logs
+*.log

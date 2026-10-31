@@ -1,0 +1,44 @@
+{
+    "name": "isucon/isureal-php",
+    "description": "ISUReal PHP implementation",
+    "type": "project",
+    "require": {
+        "php": "^8.5",
+        "ext-gd": "*",
+        "ext-intl": "*",
+        "ext-mbstring": "*",
+        "ext-pdo_pgsql": "*",
+        "ext-zip": "*",
+        "php-di/php-di": "^7.1",
+        "slim/psr7": "^1.8",
+        "slim/slim": "^4.15",
+        "symfony/uid": "^8.1"
+    },
+    "require-dev": {
+        "ext-curl": "*",
+        "phpstan/phpstan": "^2.3",
+        "phpunit/phpunit": "^13.4",
+        "squizlabs/php_codesniffer": "^4.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Isureal\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Isureal\\Tests\\": "tests/"
+        }
+    },
+    "config": {
+        "optimize-autoloader": true,
+        "process-timeout": 0,
+        "sort-packages": true
+    },
+    "scripts": {
+        "test": "phpunit",
+        "analyse": "phpstan analyse",
+        "lint": "phpcs",
+        "lint:fix": "phpcbf"
+    }
+}

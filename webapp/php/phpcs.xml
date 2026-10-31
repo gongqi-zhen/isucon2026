@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<ruleset name="isureal">
+    <description>PSR-12 coding standard</description>
+    <arg name="extensions" value="php"/>
+    <arg name="colors"/>
+    <arg value="sp"/>
+
+    <rule ref="PSR12">
+        <exclude name="Generic.Files.LineLength"/>
+    </rule>
+
+    <file>app</file>
+    <file>public</file>
+    <file>src</file>
+    <file>tests</file>
+</ruleset>

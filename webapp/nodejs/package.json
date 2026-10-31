@@ -1,0 +1,25 @@
+{
+  "name": "isureal",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=26"
+  },
+  "scripts": {
+    "start": "node src/main.ts",
+    "check": "tsc",
+    "test": "node --test 'test/**/*.test.ts'"
+  },
+  "dependencies": {
+    "@hono/node-server": "2.1.5",
+    "hono": "4.13.14",
+    "jpeg-js": "0.4.4",
+    "jszip": "3.10.2",
+    "pg": "8.23.1"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.5",
+    "@types/pg": "8.23.1",
+    "typescript": "7.0.2"
+  }
+}

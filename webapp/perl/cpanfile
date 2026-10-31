@@ -1,0 +1,15 @@
+requires 'perl', '5.044';
+
+requires 'Mojolicious',        '9.51';
+requires 'Mojo::Pg',           '5.0';
+requires 'DBD::Pg',            '3.21.2';
+requires 'Future::AsyncAwait', '0.71';
+requires 'EV',                 '4.37';
+requires 'Cpanel::JSON::XS',   '4.40';
+requires 'Crypt::URandom',     '0.55';
+requires 'Time::Moment',       '0.46';
+requires 'Imager',             '1.040';
+
+on test => sub {
+    requires 'Test2::V0', '1.302226';
+};

@@ -1,0 +1,16 @@
+# frozen_string_literal: true
+
+source 'https://rubygems.org'
+
+gem 'connection_pool'
+gem 'ffi'
+gem 'pg'
+gem 'puma'
+gem 'rubyzip'
+gem 'sinatra'
+
+group :test do
+  gem 'minitest'
+  gem 'pure_jpeg', '0.4.0'
+  gem 'rack-test', '2.2.0'
+end
