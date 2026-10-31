@@ -350,46 +350,54 @@ func TestLockInteractionVersusBlockNoDeadlock(t *testing.T) {
 	}
 }
 
-// lockInteractionUsers は、行為者を FOR NO KEY UPDATE、投稿者を FOR SHARE でロックする。
+// isureal_lock_interaction_users は、行為者と投稿者をどちらも FOR SHARE でロックする（#86）。
+// 権限を減らしうる変更（ブロック、友達の解除、投稿の編集・削除。どれも FOR NO KEY UPDATE）は待たされ、
+// 行為者や投稿者本人のほかの操作（ログイン、投稿、コメント、RealMoji。どれも FOR SHARE）は待たされない。
 func TestLockInteractionUsersModes(t *testing.T) {
 	env := newLockTestEnv(t)
 	ctx := context.Background()
-	for _, order := range []string{"actor<author", "actor>author"} {
+	for _, order := range []string{"actor<author", "actor>author", "actor=author"} {
 		a, b := env.user("asia"), env.user("asia")
 		actor, author := min(a.id, b.id), max(a.id, b.id)
-		if order == "actor>author" {
+		switch order {
+		case "actor>author":
 			actor, author = author, actor
+		case "actor=author":
+			author = actor
 		}
 		tx, err := env.db.BeginTxx(ctx, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		users, err := lockInteractionUsers(ctx, tx, actor, author)
-		if err != nil || len(users) != 2 || users[actor].ID != actor || users[author].ID != author {
-			t.Fatalf("%s: users=%v err=%v", order, users, err)
+		var locked bool
+		if err := tx.GetContext(ctx, &locked, `SELECT isureal_lock_interaction_users($1, $2)`, actor, author); err != nil || !locked {
+			t.Fatalf("%s: locked=%v err=%v", order, locked, err)
 		}
-		other, _ := env.db.BeginTxx(ctx, nil)
-		other.MustExec(`SET LOCAL lock_timeout = '300ms'`)
-		// 投稿者は、別の行為者も FOR SHARE で同時にロックできる。
-		if _, err := other.Exec(`SELECT 1 FROM users WHERE id = $1 FOR SHARE`, author); err != nil {
-			t.Errorf("%s: author FOR SHARE blocked: %v", order, err)
+		try := func(mode, id string) error {
+			other, err := env.db.BeginTxx(ctx, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer other.Rollback()
+			other.MustExec(`SET LOCAL lock_timeout = '300ms'`)
+			_, err = other.Exec(`SELECT 1 FROM users WHERE id = $1 `+mode, id)
+			return err
 		}
-		other.Rollback()
-		// 投稿者への FOR NO KEY UPDATE（ブロックなど）は待たされる。
-		other, _ = env.db.BeginTxx(ctx, nil)
-		other.MustExec(`SET LOCAL lock_timeout = '300ms'`)
-		if _, err := other.Exec(`SELECT 1 FROM users WHERE id = $1 FOR NO KEY UPDATE`, author); err == nil {
-			t.Errorf("%s: author FOR NO KEY UPDATE was not blocked", order)
+		for _, id := range []string{actor, author} {
+			if err := try("FOR SHARE", id); err != nil {
+				t.Errorf("%s: FOR SHARE of %s was blocked: %v", order, id, err)
+			}
+			if err := try("FOR NO KEY UPDATE", id); err == nil {
+				t.Errorf("%s: FOR NO KEY UPDATE of %s was not blocked", order, id)
+			}
 		}
-		other.Rollback()
-		// 行為者は FOR SHARE でもロックできない（同じ行為者の操作は直列）。
-		other, _ = env.db.BeginTxx(ctx, nil)
-		other.MustExec(`SET LOCAL lock_timeout = '300ms'`)
-		if _, err := other.Exec(`SELECT 1 FROM users WHERE id = $1 FOR SHARE`, actor); err == nil {
-			t.Errorf("%s: actor FOR SHARE was not blocked", order)
-		}
-		other.Rollback()
 		tx.Rollback()
+	}
+	// どちらかがいなければ false を返す。
+	u := env.user("asia")
+	var locked bool
+	if err := env.db.Get(&locked, `SELECT isureal_lock_interaction_users($1, $2)`, u.id, "no-such-user"); err != nil || locked {
+		t.Fatalf("missing user: locked=%v err=%v", locked, err)
 	}
 }
 
