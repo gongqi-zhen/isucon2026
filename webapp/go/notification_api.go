@@ -27,6 +27,10 @@ func getNotificationsHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := h.DB.GetContext(ctx, &connectedAt, `SELECT clock_timestamp()`); err != nil {
 			return err
 		}
+		// 通知の確認より前に購読し、確認と購読の間に始まった投稿期間を取りこぼさないようにする。
+		hub := getNotificationHub(h.DB)
+		waiter := hub.subscribe(userID, session.Region)
+		defer hub.unsubscribe(waiter)
 		response := c.Response()
 		response.Header().Set("Content-Type", "text/event-stream")
 		response.WriteHeader(http.StatusOK)
@@ -34,19 +38,17 @@ func getNotificationsHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := controller.Flush(); err != nil {
 			return nil
 		}
-		ticker := time.NewTicker(500 * time.Millisecond)
-		defer ticker.Stop()
+		user, err := getUser(ctx, h.DB, userID)
+		if err != nil {
+			if !errors.Is(err, sql.ErrNoRows) && ctx.Err() == nil {
+				c.Logger().Error("failed to get notification recipient", "error", err)
+			}
+			return nil
+		}
+		if user.Region != session.Region {
+			return nil
+		}
 		for {
-			user, err := getUser(ctx, h.DB, userID)
-			if err != nil {
-				if !errors.Is(err, sql.ErrNoRows) && ctx.Err() == nil {
-					c.Logger().Error("failed to get notification recipient", "error", err)
-				}
-				return nil
-			}
-			if user.Region != session.Region {
-				return nil
-			}
 			var notification getNotificationsResponse
 			err = h.DB.GetContext(ctx, &notification, `
     SELECT n.id, n.posting_window_id, w.region, n.created_at
@@ -75,7 +77,9 @@ func getNotificationsHandler(h *HandlerContext) echo.HandlerFunc {
 			select {
 			case <-ctx.Done():
 				return nil
-			case <-ticker.C:
+			case <-waiter.gone:
+				return nil
+			case <-waiter.changed:
 			}
 		}
 	}
