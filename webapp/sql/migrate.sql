@@ -273,8 +273,13 @@ END $$;
 --   同時のログインで追加されたセッションを退会で無効にし損なう。）
 
 -- ログイン（loginHandler）。out_result: ok / invalid_credentials（401）。
--- 変更前と同じ順序：ユーザー名で行をロック → active と SecretKey の確認 → 有効なセッションを無効にして、新しいセッションを追加。
+-- 順序：active で SecretKey の合う行を FOR SHARE でロック → ログインの advisory lock → 有効なセッションを無効にして、新しいセッションを追加。
 -- 追加するセッションは無効にする文の後に INSERT するので、無効にはならない。
+-- 本人の行は FOR SHARE にする（#86）。退会（UPDATE）とはぶつかり、本人の投稿へのコメントや RealMoji（投稿者を FOR SHARE）とはぶつからない。
+-- 同じ利用者のログインどうしは advisory lock で直列にする。後のログインは先のコミットを待ってから、新しいスナップショットで
+-- login_sessions を読むので、先のログインのセッションも無効にする。
+-- SecretKey と status を WHERE で確かめるので、正しくないログインでは行をロックしない。
+-- 退会と入れ違いになった場合は、ロックを待ったあとに WHERE を確かめ直すので、0行になって 401 を返す（変更前と同じ）。
 CREATE OR REPLACE FUNCTION isureal_login(p_username text, p_secret_key_hash text, p_session_id text, p_token_hash text)
 RETURNS TABLE(out_result text,
               out_user_id text, out_username text, out_secret_key_hash text, out_display_name text, out_bio text,
@@ -283,12 +288,15 @@ LANGUAGE plpgsql AS $$
 DECLARE
   u users%ROWTYPE;
 BEGIN
-  SELECT * INTO u FROM users WHERE username = p_username FOR NO KEY UPDATE;
-  IF NOT FOUND OR u.status <> 'active' OR u.secret_key_hash <> p_secret_key_hash THEN
+  SELECT * INTO u FROM users
+  WHERE username = p_username AND status = 'active' AND secret_key_hash = p_secret_key_hash
+  FOR SHARE;
+  IF NOT FOUND THEN
     RETURN QUERY SELECT 'invalid_credentials'::text,
       NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text;
     RETURN;
   END IF;
+  PERFORM pg_advisory_xact_lock(hashtextextended('login:' || u.id, 0));
   UPDATE login_sessions SET active = false, invalidated_at = clock_timestamp(), reason = 'replaced'
   WHERE user_id = u.id AND active = true;
   INSERT INTO login_sessions (id, user_id, token_hash) VALUES (p_session_id, u.id, p_token_hash);
