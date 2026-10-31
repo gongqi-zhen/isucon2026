@@ -34,7 +34,7 @@ for h in asia1 asia2 europe1 america1; do echo "== $h"; ssh $h 'grep -c avx2 /pr
 
 `webapp/go/cmd/isureal/default.pgo` にプロファイルを置くと、`go build` が自動で使う（Go 1.21 以降の `-pgo=auto`）。よく呼ばれる関数のインライン化と、インターフェースの呼び出しの具体化が進み、典型的には 2〜7% の CPU が減る。
 
-プロファイルは、負荷走行中の asia1 のものを使う（pprof は `ISUREAL_PPROF_ADDR`、既定 `127.0.0.1:6060`。#2）。
+プロファイルは、負荷走行中の asia1 のものを使う（pprof は `ISUREAL_PPROF_ADDR`。既定は `off` なので、取る前に asia1 の `~/env.sh` に `ISUREAL_PPROF_ADDR=127.0.0.1:6060` を足して `isureal-go` を再起動し、取り終えたら外して再起動する。#2）。
 
 1. 負荷走行を始めてから、asia1 で 30 秒のプロファイルを取る。
    ```bash

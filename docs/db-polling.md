@@ -36,7 +36,7 @@
 SELECT pg_stat_statements_reset();
 ```
 
-走行の後に、ポーリングのクエリを集計する。`pg_stat_statements.track = all` なので、関数の中の文も別の行として出る。
+走行の後に、ポーリングのクエリを集計する。`pg_stat_statements.track = all` にしておくと、関数の中の文も別の行として出る（既定の設定では `none` にしてあるので、測る前に `all` にして `pg_reload_conf()` する。`etc/postgresql/conf.d/isucon.conf`）。
 
 ```sql
 SELECT calls, round(total_exec_time) AS total_ms, round(mean_exec_time::numeric, 2) AS mean_ms, rows,

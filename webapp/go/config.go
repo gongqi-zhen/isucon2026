@@ -40,8 +40,9 @@ func ConfigFromEnv() *Config {
 		// TLS ハンドシェイクと暗号化を省く。サーバ間はルーター経由の閉じたネットワーク。
 		DBSSLMode: envOrDefault("ISUREAL_DB_SSLMODE", "disable"),
 		LogLevel:  envOrDefault("ISUREAL_LOG_LEVEL", "debug"),
-		// pprof の待ち受けアドレス。"off" で無効。
-		PprofAddr: envOrDefault("ISUREAL_PPROF_ADDR", "127.0.0.1:6060"),
+		// pprof と /debug/vars（metrics.go）の待ち受けアドレス。既定は "off"（無効）。
+		// 計測するときだけ env.sh に ISUREAL_PPROF_ADDR=127.0.0.1:6060 を足して再起動する。
+		PprofAddr: envOrDefault("ISUREAL_PPROF_ADDR", "off"),
 		// asia2 で動かすときは、VPC 内のアドレスだけで待ち受ける（docs/asia-role-split.md）。
 		ListenAddr: envOrDefault("ISUREAL_LISTEN_ADDR", ":8080"),
 		// 全台の合計が PostgreSQL の max_connections を超えないように、台ごとに変えられるようにする。
