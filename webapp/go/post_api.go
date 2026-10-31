@@ -3,6 +3,7 @@ package isureal
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -80,75 +81,44 @@ func createPostHandler(h *HandlerContext) echo.HandlerFunc {
 
 		ctx := c.Request().Context()
 		userID := GetSession(c).UserID
-		tx, err := h.DB.BeginTxx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-		// 画像の送信は、リージョンをまたぐと時間がかかる。ほかの投稿と衝突するロックを取る前に済ませておく。
-		// 投稿が受け付けられなかった場合は、ロールバックで画像も消える。
-		imageID := uuid.NewString()
-		if _, err := tx.ExecContext(ctx, `INSERT INTO image_objects (id, owner_user_id, data, media_type) VALUES ($1, $2, $3, 'image/jpeg')`, imageID, userID, imageData); err != nil {
-			return err
-		}
-		lockedUser, err := lockUser(ctx, tx, userID)
-		if err != nil {
-			return err
-		}
-		user, err := activeUser(lockedUser)
-		if err != nil {
-			return err
-		}
-		var window struct {
-			ID        string    `db:"id"`
-			LocalDate time.Time `db:"local_date"`
-			StartsAt  time.Time `db:"starts_at"`
-		}
-		// 投稿期間の行は FOR SHARE でロックする。同じリージョンの投稿どうしは並行して進み、
-		// 投稿期間の終了（UPDATE posting_windows）とは衝突するので、終了前に始まった投稿は終了より先に確定する。
-		// 終了と入れ違いになると、ロックを待ったあとの再評価で行が条件に合わなくなるので、新しい投稿期間を取り直す。
-		err = tx.GetContext(ctx, &window, `SELECT id, local_date, starts_at FROM posting_windows WHERE region = $1 AND ended_at IS NULL FOR SHARE`, user.Region)
-		if errors.Is(err, sql.ErrNoRows) {
-			err = tx.GetContext(ctx, &window, `SELECT id, local_date, starts_at FROM posting_windows WHERE region = $1 AND ended_at IS NULL FOR SHARE`, user.Region)
-		}
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return NewAPIError(http.StatusConflict, "post_slot_unavailable")
-			}
-			return err
-		}
-		var counts struct {
-			Active  int `db:"active"`
-			Deleted int `db:"deleted"`
-		}
-		if err := tx.GetContext(ctx, &counts, `
-   SELECT count(*) FILTER (WHERE deleted_at IS NULL) AS active,
-          count(*) FILTER (WHERE deleted_at IS NOT NULL) AS deleted
-   FROM posts p JOIN posting_windows w ON w.id = p.posting_window_id
-   WHERE p.author_id = $1 AND w.local_date = $2
-  `, userID, window.LocalDate); err != nil {
-			return err
-		}
-		postedAt := time.Now().UTC()
-		if counts.Active != 0 || counts.Deleted >= 2 || postedAt.Before(window.StartsAt) {
-			return NewAPIError(http.StatusConflict, "post_slot_unavailable")
-		}
-		postID := uuid.NewString()
-		if _, err := tx.ExecContext(ctx, `
-   INSERT INTO posts (id, author_id, posting_window_id, image_id, caption, visibility,
-                      location_kind, latitude, longitude, locality, posted_at)
-   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-  `, postID, userID, window.ID, imageID, input.Caption, input.Visibility,
-			location.Kind, location.Latitude, location.Longitude, location.Locality, postedAt); err != nil {
-			return err
-		}
-		post, err := getPost(ctx, tx, postID)
-		if err != nil {
-			return err
-		}
+		// 本人の行のロック、投稿期間の FOR SHARE、その日の件数の確認、画像と投稿の INSERT を、DB の関数1回の呼び出しで行う（#50）。
+		// アップロードした画像の有効期限は、確定より前に取った時刻から数える。
+		imageID, postID := uuid.NewString(), uuid.NewString()
 		validatedAt := time.Now()
-		if err := tx.Commit(); err != nil {
+		var row struct {
+			Result         string     `db:"out_result"`
+			WindowID       *string    `db:"out_posting_window_id"`
+			PostedAt       *time.Time `db:"out_posted_at"`
+			OnTimeDeadline *time.Time `db:"out_on_time_deadline"`
+			Latitude       *float64   `db:"out_latitude"`
+			Longitude      *float64   `db:"out_longitude"`
+			funcUser
+		}
+		if err := h.DB.GetContext(ctx, &row, `
+   SELECT out_result, out_posting_window_id, out_posted_at, out_on_time_deadline, out_latitude, out_longitude, `+funcUserColumns+`
+   FROM isureal_create_post($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+  `, userID, postID, imageID, imageData, input.Caption, input.Visibility,
+			location.Kind, location.Latitude, location.Longitude, location.Locality); err != nil {
 			return err
+		}
+		switch row.Result {
+		case "ok":
+		case "slot_unavailable":
+			return NewAPIError(http.StatusConflict, "post_slot_unavailable")
+		case "user_not_found":
+			return sql.ErrNoRows
+		default:
+			return fmt.Errorf("unexpected create post result: %q", row.Result)
+		}
+		user, err := activeUser(row.user())
+		if err != nil {
+			return err
+		}
+		post := Post{
+			ID: postID, AuthorID: userID, PostingWindowID: *row.WindowID, ImageID: imageID,
+			Caption: input.Caption, Visibility: input.Visibility,
+			PostLocation: PostLocation{Kind: location.Kind, Latitude: row.Latitude, Longitude: row.Longitude, Locality: location.Locality},
+			PostedAt:     *row.PostedAt, OnTimeDeadline: *row.OnTimeDeadline,
 		}
 		cacheUploadedImage(imageID, imageData, validatedAt)
 		return c.JSON(http.StatusCreated, newPostResponse(post, user))
