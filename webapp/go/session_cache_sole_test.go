@@ -136,7 +136,7 @@ func TestSessionCacheRevalidateSentBeforeEvictionDoesNotExtend(t *testing.T) {
 	c.evictUser("u1")
 	// 消した時刻より古い validatedAt のエントリが残っていたとする（evictUser と同時に入ったものなど）。
 	c.mu.Lock()
-	c.entries["t1"] = &sessionCacheEntry{session: Session{UserID: "u1", TokenHash: "t1", Region: "europe"}, validatedAt: clock.now().Add(-time.Millisecond), usedAt: clock.now()}
+	c.entries["t1"] = &sessionCacheEntry{session: Session{UserID: "u1", TokenHash: "t1", Region: "europe"}, validatedAt: clock.now().Add(-time.Millisecond)}
 	c.mu.Unlock()
 	source := &hookSessionSource{valid: map[string]bool{"t1": true}}
 	// 確かめ直しのクエリを、消した時刻と同じ時刻に送る。

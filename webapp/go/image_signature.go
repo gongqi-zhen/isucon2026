@@ -88,9 +88,14 @@ func signedImageURLAt(user User, imageID string, createdAt time.Time) string {
 			verifiedSignatureCache.Add(verifiedSignatureKey(imageID, expText, entry.sig), struct{}{}, 1, time.Unix(exp, 0))
 		}
 	}
-	query := url.Values{
-		"exp": {expText},
-		"sig": {entry.sig},
-	}
-	return "/api/images/" + url.PathEscape(imageID) + "?" + query.Encode()
+	return signedImageURLString(imageID, expText, entry.sig)
+}
+
+// signedImageURLString は署名付き URL の文字列を組み立てる。
+// 以前は url.Values{...}.Encode() を使っていたが、map の確保とキーの並べ替えを画像1枚ごとに行っていた（#112）。
+// キーは exp と sig の2つで固定で、アルファベット順も exp、sig の順。exp は数字だけ、sig は base64 の RawURLEncoding
+// （A-Z、a-z、0-9、-、_）なので、QueryEscape しても変わらない。したがって直接つなげても同じ文字列になる。
+// imageID は UUID だが、そうでない場合にも同じ文字列になるように PathEscape は残す（エスケープが要らなければ確保しない）。
+func signedImageURLString(imageID, expText, sig string) string {
+	return "/api/images/" + url.PathEscape(imageID) + "?exp=" + expText + "&sig=" + sig
 }

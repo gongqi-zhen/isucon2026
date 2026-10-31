@@ -125,15 +125,10 @@ func memoryUserJSONObject(alias string) string {
 // 並び順と件数の上限は以前と同じ：投稿は posted_at DESC, id DESC で51件読み、50件を超えたら hasMore。
 // RealMoji は現在のもの（差し替え・削除されていない）を created_at DESC, id DESC、
 // コメントは削除されていないものを created_at, id の順に、どちらも active な利用者のものだけを投稿ごとに先頭50件。
-func listMemories(ctx context.Context, db sqlx.QueryerContext, userID string, start, end time.Time, beforeAt *time.Time, beforeID string) (getMemoriesResponse, error) {
-	var response getMemoriesResponse
-	if (beforeAt == nil) != (beforeID == "") {
-		return response, NewAPIError(http.StatusBadRequest, "invalid_pagination")
-	}
-	var rows []memoryPostRow
-	if err := sqlx.SelectContext(ctx, db, &rows, `
+// listMemoriesQuery は起動時に1回だけ組み立てる（#112）。引数は $1 = 本人、$2 = 期間の始まり、$3 = 期間の終わり、$4 = beforeAt、$5 = beforeID。
+var listMemoriesQuery = `
   WITH mp AS (
-    SELECT `+postColumns+`, `+userColumnsAs("u", "author")+`
+    SELECT ` + postColumns + `, ` + userColumnsAs("u", "author") + `
     FROM posts p
     JOIN posting_windows w ON w.id = p.posting_window_id
     JOIN users u ON u.id = p.author_id AND u.status = 'active'
@@ -149,7 +144,7 @@ func listMemories(ctx context.Context, db sqlx.QueryerContext, userID string, st
         SELECT r.created_at, r.id, json_build_object(
           'id', r.id, 'reaction_type', r.reaction_type, 'image_id', r.image_id,
           'created_at_us', (extract(epoch FROM r.created_at) * 1000000)::bigint,
-          'user', `+memoryUserJSONObject("ru")+`) AS obj
+          'user', ` + memoryUserJSONObject("ru") + `) AS obj
         FROM realmojis r JOIN users ru ON ru.id = r.reactor_id AND ru.status = 'active'
         WHERE r.post_id = mp.id AND r.replaced_at IS NULL AND r.deleted_at IS NULL
         ORDER BY r.created_at DESC, r.id DESC LIMIT 50
@@ -161,7 +156,7 @@ func listMemories(ctx context.Context, db sqlx.QueryerContext, userID string, st
         SELECT c.created_at, c.id, json_build_object(
           'id', c.id, 'body', c.body,
           'created_at_us', (extract(epoch FROM c.created_at) * 1000000)::bigint,
-          'user', `+memoryUserJSONObject("cu")+`) AS obj
+          'user', ` + memoryUserJSONObject("cu") + `) AS obj
         FROM comments c JOIN users cu ON cu.id = c.author_id AND cu.status = 'active'
         WHERE c.post_id = mp.id AND c.deleted_at IS NULL
         ORDER BY c.created_at, c.id LIMIT 50
@@ -169,7 +164,20 @@ func listMemories(ctx context.Context, db sqlx.QueryerContext, userID string, st
     ), '[]') AS comments_json
   FROM mp
   ORDER BY mp.posted_at DESC, mp.id DESC
- `, userID, start, end, beforeAt, beforeID); err != nil {
+ `
+
+// listMemories は自分の投稿と、それぞれの RealMoji とコメント（各最大50件）を1回のクエリで読む。
+// europe と america では DB への1往復が約100ms なので、以前の3往復（投稿、RealMoji、コメント）を1往復にした。
+// 並び順と件数の上限は以前と同じ：投稿は posted_at DESC, id DESC で51件読み、50件を超えたら hasMore。
+// RealMoji は現在のもの（差し替え・削除されていない）を created_at DESC, id DESC、
+// コメントは削除されていないものを created_at, id の順に、どちらも active な利用者のものだけを投稿ごとに先頭50件。
+func listMemories(ctx context.Context, db sqlx.QueryerContext, userID string, start, end time.Time, beforeAt *time.Time, beforeID string) (getMemoriesResponse, error) {
+	var response getMemoriesResponse
+	if (beforeAt == nil) != (beforeID == "") {
+		return response, NewAPIError(http.StatusBadRequest, "invalid_pagination")
+	}
+	var rows []memoryPostRow
+	if err := sqlx.SelectContext(ctx, db, &rows, listMemoriesQuery, userID, start, end, beforeAt, beforeID); err != nil {
 		return response, err
 	}
 	response.HasMore = len(rows) > 50

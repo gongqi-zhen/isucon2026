@@ -63,14 +63,17 @@ type PostWithAuthor struct {
 	Author User `db:"author"`
 }
 
-func selectPostsWithAuthor(ctx context.Context, db sqlx.QueryerContext, conditions string, args ...any) ([]PostWithAuthor, error) {
-	var posts []PostWithAuthor
-	if err := sqlx.SelectContext(ctx, db, &posts, `
-  SELECT `+postColumns+`, `+userColumnsAs("u", "author")+`
+// クエリの文字列は起動時に1回だけ組み立てる（#112）。userColumnsAs は fmt.Sprintf を列の数だけ呼ぶので、リクエストごとには呼ばない。
+var selectPostsWithAuthorQuery = `
+  SELECT ` + postColumns + `, ` + userColumnsAs("u", "author") + `
   FROM posts p
   JOIN posting_windows w ON w.id = p.posting_window_id
   JOIN users u ON u.id = p.author_id AND u.status = 'active'
-  WHERE p.deleted_at IS NULL `+conditions, args...); err != nil {
+  WHERE p.deleted_at IS NULL `
+
+func selectPostsWithAuthor(ctx context.Context, db sqlx.QueryerContext, conditions string, args ...any) ([]PostWithAuthor, error) {
+	var posts []PostWithAuthor
+	if err := sqlx.SelectContext(ctx, db, &posts, selectPostsWithAuthorQuery+conditions, args...); err != nil {
 		return nil, err
 	}
 	for i := range posts {
@@ -115,13 +118,9 @@ type viewerContextRow struct {
 	FriendsOfFriendsIDs string `db:"friends_of_friends_ids"`
 }
 
-// loadViewerContext は閲覧者の情報を1回のクエリでまとめて取得する。
-func loadViewerContext(ctx context.Context, db sqlx.QueryerContext, viewerID string) (viewerContext, error) {
-	viewer := viewerContext{Friends: map[string]bool{}, FriendsOfFriends: map[string]bool{}, MutualFriends: map[string]int{}, Blocked: map[string]bool{}}
-	var row viewerContextRow
-	if err := sqlx.GetContext(ctx, db, &row, `
-  WITH `+viewerFriendsCTE+`
-  SELECT `+qualifiedUserColumns("u")+`,
+var loadViewerContextQuery = `
+  WITH ` + viewerFriendsCTE + `
+  SELECT ` + qualifiedUserColumns("u") + `,
     EXISTS(
       SELECT 1 FROM posts p
       JOIN posting_windows posted ON posted.id = p.posting_window_id
@@ -140,7 +139,13 @@ func loadViewerContext(ctx context.Context, db sqlx.QueryerContext, viewerID str
       SELECT f.user_low_id FROM friendships f WHERE f.user_high_id IN (SELECT id FROM viewer_friends)
     ))::text AS friends_of_friends_ids
   FROM users u WHERE u.id = $1 AND u.status = 'active'
- `, viewerID); err != nil {
+ `
+
+// loadViewerContext は閲覧者の情報を1回のクエリでまとめて取得する。
+func loadViewerContext(ctx context.Context, db sqlx.QueryerContext, viewerID string) (viewerContext, error) {
+	viewer := viewerContext{Friends: map[string]bool{}, FriendsOfFriends: map[string]bool{}, MutualFriends: map[string]int{}, Blocked: map[string]bool{}}
+	var row viewerContextRow
+	if err := sqlx.GetContext(ctx, db, &row, loadViewerContextQuery, viewerID); err != nil {
 		return viewer, err
 	}
 	viewer.User = row.User
@@ -213,12 +218,10 @@ type postAccess struct {
 
 // loadPostAccess は投稿と、権限判定に必要な閲覧者の情報を1回のクエリで取得する。
 // 投稿がない場合は sql.ErrNoRows を返す。
-func loadPostAccess(ctx context.Context, db sqlx.QueryerContext, viewerID, postID string) (postAccess, error) {
-	var access postAccess
-	err := sqlx.GetContext(ctx, db, &access, `
+var loadPostAccessQuery = `
   WITH viewer AS (SELECT id, region FROM users WHERE id = $1 AND status = 'active'),
-  `+viewerFriendsCTE+`
-  SELECT `+postColumns+`, `+userColumnsAs("u", "author")+`,
+  ` + viewerFriendsCTE + `
+  SELECT ` + postColumns + `, ` + userColumnsAs("u", "author") + `,
     EXISTS(SELECT 1 FROM viewer) AS viewer_active,
     EXISTS(
       SELECT 1 FROM posts vp
@@ -242,7 +245,13 @@ func loadPostAccess(ctx context.Context, db sqlx.QueryerContext, viewerID, postI
   JOIN posting_windows w ON w.id = p.posting_window_id
   JOIN users u ON u.id = p.author_id AND u.status = 'active'
   WHERE p.deleted_at IS NULL AND p.id = $2
- `, viewerID, postID)
+ `
+
+// loadPostAccess は投稿と、権限判定に必要な閲覧者の情報を1回のクエリで取得する。
+// 投稿がない場合は sql.ErrNoRows を返す。
+func loadPostAccess(ctx context.Context, db sqlx.QueryerContext, viewerID, postID string) (postAccess, error) {
+	var access postAccess
+	err := sqlx.GetContext(ctx, db, &access, loadPostAccessQuery, viewerID, postID)
 	if err != nil {
 		return access, err
 	}
