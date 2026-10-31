@@ -264,3 +264,84 @@ BEGIN
   END IF;
   RETURN 'ok';
 END $$;
+
+-- 利用者のアカウントに関わる書き込みを、ロックの取得から確定までを DB の中で行う関数にする（#67）。
+-- アプリは autocommit の1文で呼ぶので、europe と america から DB への往復は1回になり、
+-- users の行のロックを持つのは関数の実行中だけになる。
+-- 関数の中の文はそれぞれ新しいスナップショットで動くので、ロックの後の文は、変更前の Go のトランザクションと同じく、ロック後の状態を見る。
+-- （CTE の1文にすると、ロックを待ったあとも文の開始時点のスナップショットで login_sessions を読むので、
+--   同時のログインで追加されたセッションを退会で無効にし損なう。）
+
+-- ログイン（loginHandler）。out_result: ok / invalid_credentials（401）。
+-- 変更前と同じ順序：ユーザー名で行をロック → active と SecretKey の確認 → 有効なセッションを無効にして、新しいセッションを追加。
+-- 追加するセッションは無効にする文の後に INSERT するので、無効にはならない。
+CREATE OR REPLACE FUNCTION isureal_login(p_username text, p_secret_key_hash text, p_session_id text, p_token_hash text)
+RETURNS TABLE(out_result text,
+              out_user_id text, out_username text, out_secret_key_hash text, out_display_name text, out_bio text,
+              out_profile_image_id text, out_region text, out_account_type text, out_status text)
+LANGUAGE plpgsql AS $$
+DECLARE
+  u users%ROWTYPE;
+BEGIN
+  SELECT * INTO u FROM users WHERE username = p_username FOR NO KEY UPDATE;
+  IF NOT FOUND OR u.status <> 'active' OR u.secret_key_hash <> p_secret_key_hash THEN
+    RETURN QUERY SELECT 'invalid_credentials'::text,
+      NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text;
+    RETURN;
+  END IF;
+  UPDATE login_sessions SET active = false, invalidated_at = clock_timestamp(), reason = 'replaced'
+  WHERE user_id = u.id AND active = true;
+  INSERT INTO login_sessions (id, user_id, token_hash) VALUES (p_session_id, u.id, p_token_hash);
+  RETURN QUERY SELECT 'ok'::text,
+    u.id::text, u.username::text, u.secret_key_hash, u.display_name, u.bio, u.profile_image_id::text, u.region, u.account_type, u.status;
+END $$;
+
+-- プロフィール画像の設定（putProfileImageHandler）。利用者の行がなければ not_found（404 account_not_found）。
+-- 変更前と同じ順序：本人の行をロック → 画像の INSERT → profile_image_id の更新 → 前の画像の DELETE。
+-- 前の画像の id はロックの後に読むので、同じ利用者の同時の差し替えでも、最後に設定された画像の行だけが残る。
+CREATE OR REPLACE FUNCTION isureal_put_profile_image(p_user_id text, p_image_id text, p_image bytea) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+  old_image_id text;
+BEGIN
+  SELECT u.profile_image_id INTO old_image_id FROM users u WHERE u.id = p_user_id FOR NO KEY UPDATE;
+  IF NOT FOUND THEN
+    RETURN 'not_found';
+  END IF;
+  INSERT INTO image_objects (id, owner_user_id, data, media_type) VALUES (p_image_id, p_user_id, p_image, 'image/jpeg');
+  UPDATE users SET profile_image_id = p_image_id, updated_at = clock_timestamp() WHERE id = p_user_id;
+  IF old_image_id IS NOT NULL THEN
+    DELETE FROM image_objects WHERE id = old_image_id;
+  END IF;
+  RETURN 'ok';
+END $$;
+
+-- プロフィール画像の削除（deleteProfileImageHandler）。利用者の行がないか、画像が設定されていなければ not_found（404 account_not_found）。
+CREATE OR REPLACE FUNCTION isureal_delete_profile_image(p_user_id text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+  old_image_id text;
+BEGIN
+  SELECT u.profile_image_id INTO old_image_id FROM users u WHERE u.id = p_user_id FOR NO KEY UPDATE;
+  IF NOT FOUND OR old_image_id IS NULL THEN
+    RETURN 'not_found';
+  END IF;
+  UPDATE users SET profile_image_id = NULL, updated_at = clock_timestamp() WHERE id = p_user_id;
+  DELETE FROM image_objects WHERE id = old_image_id;
+  RETURN 'ok';
+END $$;
+
+-- 退会（deleteAccountHandler）。active な利用者がいなければ not_found（404 account_not_found）。
+-- 本人の行をロックしてから、状態の更新と、有効なセッションの無効化を行う。
+CREATE OR REPLACE FUNCTION isureal_delete_account(p_user_id text) RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM 1 FROM users u WHERE u.id = p_user_id AND u.status = 'active' FOR NO KEY UPDATE;
+  IF NOT FOUND THEN
+    RETURN 'not_found';
+  END IF;
+  UPDATE users SET status = 'deleted', deleted_at = clock_timestamp(), updated_at = clock_timestamp() WHERE id = p_user_id;
+  UPDATE login_sessions SET active = false, invalidated_at = clock_timestamp(), reason = 'account_deletion'
+  WHERE user_id = p_user_id AND active = true;
+  RETURN 'ok';
+END $$;
