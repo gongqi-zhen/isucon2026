@@ -2,11 +2,13 @@ package isureal
 
 import (
 	"context"
+	"expvar"
 	"log"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -21,7 +23,7 @@ import (
 //
 //  1. 読む側：エントリは「DB で有効と確かめたクエリを送った時刻」（validatedAt）を持ち、
 //     そこから sessionCacheTTL 以内のときだけ使う。古ければ DB を引き直す。
-//     キャッシュを持つプロセスは sessionCacheInterval ごとに、持っている全トークンをまとめて1クエリで確かめ直す。
+//     キャッシュを持つプロセスは sessionCacheInterval ごとに、持っている全トークン（最近使ったもの。#110）をまとめて1クエリで確かめ直す。
 //  2. 書く側：セッションを無効にする操作（ログイン、ログアウト、退会、リージョン変更）は、
 //     キャッシュを持ちうるリージョンが関わるとき、コミットしてから sessionCacheTTL 待って応答する。
 //
@@ -47,6 +49,13 @@ import (
 //     revalidate でも validatedAt を進めない。evictedAt より後に送ったクエリはコミットの後なので、
 //     無効になったセッションを有効と判定しない。
 //
+// 確かめ直しの送り方（#121）：europe と america から DB への1往復は約100ms で、確かめ直しは TTL（400ms）で打ち切る。
+// 1本ずつ送ると、1本が遅れたり打ち切られたりした間は validatedAt が進まず、キャッシュが一斉に外れていた。
+// そこで、前の1本の完了を待たずに sessionCacheInterval ごとに送る（同時に sessionCacheMaxInFlight 本まで）。
+// 遅れて返った古い結果は、validatedAt より後に送ったものでなければ使わないので、約束1〜3はそのまま成り立つ。
+// また、リクエストの処理と同じプールを使うと接続を借りる待ちで打ち切られるので、専用の小さなプールを使う（openSessionCacheDB）。
+// 最後に使ってから sessionCacheIdle を過ぎたエントリは、確かめ直さずに消す（#110。送る件数を減らす。次に使われたときは DB を引く）。
+//
 // 利用者の行のキャッシュ（#58）：エントリは、セッションと同じクエリで読んだ利用者の行（表示に使う列）も持ち、
 // GET /api/me はそれを使う。確かめ直しのクエリは、行の md5（fingerprint）が変わった利用者の行だけを返す。
 // 行と validatedAt は必ず同じクエリの結果で一緒に進めるので、約束1は利用者の行にもそのまま当てはまる。
@@ -58,6 +67,10 @@ var (
 	sessionCacheTTL      = time.Duration(envInt64("ISUREAL_SESSION_CACHE_TTL_MS", 400)) * time.Millisecond
 	sessionCacheInterval = time.Duration(envInt64("ISUREAL_SESSION_CACHE_INTERVAL_MS", 100)) * time.Millisecond
 	sessionCacheMax      = int(envInt64("ISUREAL_SESSION_CACHE_MAX", 100000))
+	// 同時に送る確かめ直しの上限と、その専用プールの接続数（#121）。TTL / interval（既定 4）より多くても、TTL で打ち切るので増えない。
+	sessionCacheMaxInFlight = max(1, int(envInt64("ISUREAL_SESSION_CACHE_MAX_IN_FLIGHT", 4)))
+	// 最後に使ってからこれを過ぎたエントリは、確かめ直さずに消す（#110）。0 なら消さない。
+	sessionCacheIdle = time.Duration(envInt64("ISUREAL_SESSION_CACHE_IDLE_MS", 10000)) * time.Millisecond
 	// このプロセスのリージョンをキャッシュするのは、このプロセスだけであることを示す（#62）。
 	// 同じリージョンのアプリを2つ以上動かすときは、どのプロセスにも設定しないこと。
 	sessionCacheSole = parseSessionCacheSole(os.Getenv("ISUREAL_SESSION_CACHE_SOLE"))
@@ -115,6 +128,52 @@ type sessionCacheEntry struct {
 	// session.User は、validatedAt に送ったクエリで読んだ利用者の行（#58）。nil なら GET /api/me は DB を引く。
 	session     Session
 	validatedAt time.Time
+	// usedAt は、最後にリクエストで使った（get で当たった、または put した）時刻（#110）。
+	usedAt time.Time
+}
+
+// sessionCacheCounters は、キャッシュの当たり・外れと、確かめ直しの回数（#121）。
+// pprof と同じポート（127.0.0.1 だけ）の /debug/vars で session_cache として読める。
+type sessionCacheCounters struct {
+	hits, misses                                 atomic.Int64
+	revalidations, revalidationFailures, skipped atomic.Int64
+	idleDropped                                  atomic.Int64
+}
+
+var sessionCacheStats sessionCacheCounters
+
+func init() {
+	expvar.Publish("session_cache", expvar.Func(func() any {
+		return map[string]int64{
+			"hits":                  sessionCacheStats.hits.Load(),
+			"misses":                sessionCacheStats.misses.Load(),
+			"revalidations":         sessionCacheStats.revalidations.Load(),
+			"revalidation_failures": sessionCacheStats.revalidationFailures.Load(),
+			"revalidation_skipped":  sessionCacheStats.skipped.Load(),
+			"idle_dropped":          sessionCacheStats.idleDropped.Load(),
+			"entries":               int64(sessions.len()),
+		}
+	}))
+}
+
+// openSessionCacheDB は、確かめ直し専用のプールを開く（#121）。リクエストの処理で接続を借りる待ちに巻き込まれないようにする。
+// このリージョンをキャッシュしないなら、db をそのまま返す（確かめ直しをしないので、接続を増やさない）。
+// 増える接続は、キャッシュするプロセスごとに sessionCacheMaxInFlight 本（既定 4）。全台の合計を max_connections に収めること。
+func openSessionCacheDB(config *Config, db *sqlx.DB) *sqlx.DB {
+	if !sessionCacheRegions[config.Region] {
+		return db
+	}
+	sessionDB, err := openDB(config)
+	if err != nil {
+		log.Printf("session cache db: %v; sharing the request pool", err)
+		return db
+	}
+	sessionDB.SetMaxOpenConns(sessionCacheMaxInFlight)
+	sessionDB.SetMaxIdleConns(sessionCacheMaxInFlight)
+	sessionDB.SetConnMaxLifetime(config.DBConnMaxLifetime)
+	sessionDB.SetConnMaxIdleTime(config.DBConnMaxIdleTime)
+	startDBPoolWarmup(sessionDB.DB, sessionCacheMaxInFlight)
+	return sessionDB
 }
 
 // sessionUserFingerprint は、users u の行の md5。確かめ直しで、変わった利用者の行だけを返してもらうのに使う。
@@ -206,7 +265,7 @@ func (c *sessionCache) init(region string, source sessionCacheSource) {
 		}
 		c.mu.Unlock()
 		if c.enabled {
-			go c.run(source)
+			go c.run(context.Background(), source, sessionCacheInterval)
 		}
 	})
 }
@@ -219,9 +278,13 @@ func (c *sessionCache) get(tokenHash string) (*Session, bool) {
 		return nil, false
 	}
 	entry, ok := c.entries[tokenHash]
-	if !ok || c.now().Sub(entry.validatedAt) > sessionCacheTTL {
+	now := c.now()
+	if !ok || now.Sub(entry.validatedAt) > sessionCacheTTL {
+		sessionCacheStats.misses.Add(1)
 		return nil, false
 	}
+	sessionCacheStats.hits.Add(1)
+	entry.usedAt = now
 	session := entry.session
 	if session.User != nil {
 		user := *session.User
@@ -242,10 +305,12 @@ func (c *sessionCache) put(session Session, sentAt time.Time) {
 	if !c.enabled || session.Region != c.region {
 		return
 	}
-	if c.now().Sub(sentAt) > sessionCacheTTL || c.sentBeforeEviction(session.UserID, sentAt) {
+	now := c.now()
+	if now.Sub(sentAt) > sessionCacheTTL || c.sentBeforeEviction(session.UserID, sentAt) {
 		return
 	}
 	if entry, ok := c.entries[session.TokenHash]; ok {
+		entry.usedAt = now
 		if sentAt.After(entry.validatedAt) {
 			// 利用者の行も同じクエリの結果に置き換える（行がなければ、古い行を残さずに捨てる）。
 			entry.session.User, entry.session.userFingerprint = session.User, session.userFingerprint
@@ -257,7 +322,7 @@ func (c *sessionCache) put(session Session, sentAt time.Time) {
 		return
 	}
 	session.Token = ""
-	c.entries[session.TokenHash] = &sessionCacheEntry{session: session, validatedAt: sentAt}
+	c.entries[session.TokenHash] = &sessionCacheEntry{session: session, validatedAt: sentAt, usedAt: now}
 }
 
 // evictUser は、その利用者のエントリを消し、消した時刻を覚える。セッションを無効にした書き込みのコミットの後に呼ぶこと。
@@ -305,6 +370,12 @@ func (c *sessionCache) solelyCaches(region string) bool {
 	return c.sole && c.enabled && c.region == region
 }
 
+func (c *sessionCache) len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.entries)
+}
+
 func (c *sessionCache) reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -323,11 +394,19 @@ func (c *sessionCache) tokenHashes() []string {
 	return hashes
 }
 
+// checks は、確かめ直すトークンを返す。最後に使ってから sessionCacheIdle を過ぎたエントリは、ここで消す（#110）。
+// 消すだけなので約束1〜3には影響しない（次に使われたときは DB を引き直す）。
 func (c *sessionCache) checks() []sessionCacheCheck {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	now := c.now()
 	checks := make([]sessionCacheCheck, 0, len(c.entries))
 	for tokenHash, entry := range c.entries {
+		if sessionCacheIdle > 0 && now.Sub(entry.usedAt) > sessionCacheIdle {
+			delete(c.entries, tokenHash)
+			sessionCacheStats.idleDropped.Add(1)
+			continue
+		}
 		fingerprint := entry.session.userFingerprint
 		if entry.session.User == nil {
 			fingerprint = ""
@@ -337,7 +416,7 @@ func (c *sessionCache) checks() []sessionCacheCheck {
 	return checks
 }
 
-// revalidate は、持っている全トークンを1クエリで確かめ直す。
+// revalidate は、持っている全トークン（最近使ったもの）を1クエリで確かめ直す。同時に何本呼んでもよい（#121）。
 // 有効なものは validatedAt を送った時刻に進め、無効なものは消す。
 // その利用者を消した時刻より前に送ったクエリでは、有効でも validatedAt を進めない（約束3）。
 // 利用者の行は、validatedAt と一緒に、同じクエリの結果に合わせる（#58）。
@@ -379,15 +458,36 @@ func (c *sessionCache) revalidate(ctx context.Context, source sessionCacheSource
 	return nil
 }
 
-func (c *sessionCache) run(source sessionCacheSource) {
-	ticker := time.NewTicker(sessionCacheInterval)
+// run は、interval ごとに確かめ直しを送る。前の1本の完了は待たない（#121）。
+// 同時に送るのは sessionCacheMaxInFlight 本まで。上限に達していたら、その回は送らない。
+// 1本ごとに TTL で打ち切る（TTL より前に送ったクエリの結果では、使えるエントリにならないため）。
+// 結果は revalidate が validatedAt より後に送ったものだけを反映するので、返る順が入れ替わっても古い結果で戻らない。
+func (c *sessionCache) run(ctx context.Context, source sessionCacheSource, interval time.Duration) {
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	for range ticker.C {
-		ctx, cancel := context.WithTimeout(context.Background(), sessionCacheTTL)
-		if err := c.revalidate(ctx, source); err != nil {
-			log.Printf("session cache revalidation failed: %v", err)
+	inFlight := make(chan struct{}, sessionCacheMaxInFlight)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 		}
-		cancel()
+		select {
+		case inFlight <- struct{}{}:
+		default:
+			sessionCacheStats.skipped.Add(1)
+			continue
+		}
+		go func() {
+			defer func() { <-inFlight }()
+			ctx, cancel := context.WithTimeout(ctx, sessionCacheTTL)
+			defer cancel()
+			sessionCacheStats.revalidations.Add(1)
+			if err := c.revalidate(ctx, source); err != nil {
+				sessionCacheStats.revalidationFailures.Add(1)
+				log.Printf("session cache revalidation failed: %v", err)
+			}
+		}()
 	}
 }
 

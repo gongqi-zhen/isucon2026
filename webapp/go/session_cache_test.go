@@ -291,3 +291,226 @@ func TestSessionCachePutReplacesUserRowOnlyWithNewerQuery(t *testing.T) {
 		t.Fatalf("a newer query did not replace the row: %+v", s.User)
 	}
 }
+
+// gatedSessionSource は、最初の1回だけ release が閉じられるまで返さない（遅れて返る確かめ直しを再現する）。
+type gatedSessionSource struct {
+	valid   map[string]bool
+	started chan struct{}
+	release chan struct{}
+	mu      sync.Mutex
+	calls   int
+}
+
+func (s *gatedSessionSource) validate(_ context.Context, _ string, checks []sessionCacheCheck) (map[string]sessionCacheValidation, error) {
+	s.mu.Lock()
+	s.calls++
+	first := s.calls == 1
+	s.mu.Unlock()
+	if first {
+		close(s.started)
+		<-s.release
+	}
+	return fakeValidate(s.valid, nil, checks), nil
+}
+
+// 確かめ直しを同時に送るとき（#121）、後から送った結果が先に返っても、遅れて返った古い結果で validatedAt は戻らない。
+func TestSessionCacheOutOfOrderRevalidationsDoNotGoBack(t *testing.T) {
+	c, clock := newTestSessionCache("europe")
+	c.put(Session{UserID: "u1", TokenHash: "t1", Region: "europe"}, clock.now())
+	source := &gatedSessionSource{valid: map[string]bool{"t1": true}, started: make(chan struct{}), release: make(chan struct{})}
+
+	clock.advance(sessionCacheInterval)
+	oldSentAt := clock.now()
+	done := make(chan error)
+	go func() { done <- c.revalidate(context.Background(), source) }()
+	<-source.started // 古い1本は oldSentAt に送られ、まだ返っていない
+
+	clock.advance(sessionCacheInterval)
+	newSentAt := clock.now()
+	if err := c.revalidate(context.Background(), source); err != nil {
+		t.Fatal(err)
+	}
+	close(source.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	validatedAt := c.entries["t1"].validatedAt
+	c.mu.Unlock()
+	if !validatedAt.Equal(newSentAt) {
+		t.Fatalf("validatedAt = %v, want the newer query %v (not the late one %v)", validatedAt, newSentAt, oldSentAt)
+	}
+}
+
+// 古い1本が遅れて返る間に、消した利用者のエントリが入り直しても、消す前に送った古い1本では延ばさない（約束3）。
+func TestSessionCacheLateRevalidationSentBeforeEvictionDoesNotExtend(t *testing.T) {
+	c, clock := newTestSessionCache("europe")
+	c.put(Session{UserID: "u1", TokenHash: "t1", Region: "europe"}, clock.now())
+	source := &gatedSessionSource{valid: map[string]bool{"t1": true}, started: make(chan struct{}), release: make(chan struct{})}
+	clock.advance(sessionCacheInterval)
+	done := make(chan error)
+	go func() { done <- c.revalidate(context.Background(), source) }()
+	<-source.started
+
+	clock.advance(time.Millisecond)
+	c.evictUser("u1")
+	clock.advance(time.Millisecond)
+	putAt := clock.now()
+	c.put(Session{UserID: "u1", TokenHash: "t1", Region: "europe"}, putAt)
+	close(source.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	validatedAt := c.entries["t1"].validatedAt
+	c.mu.Unlock()
+	if !validatedAt.Equal(putAt) {
+		t.Fatalf("validatedAt = %v, want %v: a query sent before the eviction must not touch the entry", validatedAt, putAt)
+	}
+}
+
+// blockingSessionSource は、ctx が終わるまで返さない（打ち切られる確かめ直しを再現する）。
+// slowCalls 回目までだけ止まり、それより後は、すぐに返す（0 なら全部止まる）。
+type blockingSessionSource struct {
+	valid     map[string]bool
+	slowCalls int
+	mu        sync.Mutex
+	calls     int
+	inFlight  int
+	maxFlight int
+}
+
+func (s *blockingSessionSource) validate(ctx context.Context, _ string, checks []sessionCacheCheck) (map[string]sessionCacheValidation, error) {
+	s.mu.Lock()
+	s.calls++
+	slow := s.slowCalls == 0 || s.calls <= s.slowCalls
+	s.inFlight++
+	s.maxFlight = max(s.maxFlight, s.inFlight)
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.inFlight--
+		s.mu.Unlock()
+	}()
+	if slow {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return fakeValidate(s.valid, nil, checks), nil
+}
+
+func (s *blockingSessionSource) stats() (calls, maxFlight int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls, s.maxFlight
+}
+
+func newRealClockSessionCache(region string) *sessionCache {
+	c := &sessionCache{now: time.Now}
+	c.start.Do(func() {})
+	c.region = region
+	c.enabled = sessionCacheRegions[region]
+	c.entries = map[string]*sessionCacheEntry{}
+	return c
+}
+
+// 1本が打ち切られるまで止まっていても、次の確かめ直しを待たずに送り、エントリは使えるまま（#121）。
+func TestSessionCacheRunDoesNotWaitForSlowRevalidation(t *testing.T) {
+	c := newRealClockSessionCache("europe")
+	c.put(Session{UserID: "u1", TokenHash: "t1", Region: "europe"}, time.Now())
+	source := &blockingSessionSource{valid: map[string]bool{"t1": true}, slowCalls: 1}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.run(ctx, source, 20*time.Millisecond)
+
+	time.Sleep(sessionCacheTTL - 100*time.Millisecond) // 最初の1本はまだ打ち切られていない
+	calls, _ := source.stats()
+	if calls < 3 {
+		t.Fatalf("calls = %d while the first revalidation is stuck, want later ones sent without waiting", calls)
+	}
+	time.Sleep(200 * time.Millisecond) // 最初に入れてから TTL を過ぎた
+	if _, ok := c.get("t1"); !ok {
+		t.Fatal("entry must stay usable: later revalidations should have refreshed it")
+	}
+}
+
+// 同時に送るのは sessionCacheMaxInFlight 本まで（専用プールの接続数と同じ）。
+func TestSessionCacheRunLimitsInFlight(t *testing.T) {
+	c := newRealClockSessionCache("europe")
+	c.put(Session{UserID: "u1", TokenHash: "t1", Region: "europe"}, time.Now())
+	source := &blockingSessionSource{valid: map[string]bool{"t1": true}}
+	skippedBefore := sessionCacheStats.skipped.Load()
+	ctx, cancel := context.WithCancel(context.Background())
+	go c.run(ctx, source, 5*time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	_, maxFlight := source.stats()
+	if maxFlight != sessionCacheMaxInFlight {
+		t.Fatalf("max in flight = %d, want %d", maxFlight, sessionCacheMaxInFlight)
+	}
+	if sessionCacheStats.skipped.Load() == skippedBefore {
+		t.Fatal("ticks while the limit is reached must be skipped")
+	}
+}
+
+// recordingSessionSource は、送られたトークンを覚える。
+type recordingSessionSource struct {
+	valid map[string]bool
+	last  []string
+}
+
+func (s *recordingSessionSource) validate(_ context.Context, _ string, checks []sessionCacheCheck) (map[string]sessionCacheValidation, error) {
+	s.last = s.last[:0]
+	for _, check := range checks {
+		s.last = append(s.last, check.TokenHash)
+	}
+	return fakeValidate(s.valid, nil, checks), nil
+}
+
+// 最後に使ってから sessionCacheIdle を過ぎたエントリは、確かめ直しに送らずに消す（#110）。使い続けているものは残る。
+func TestSessionCacheDropsIdleEntries(t *testing.T) {
+	if sessionCacheIdle <= 0 {
+		t.Skip("idle dropping is disabled")
+	}
+	c, clock := newTestSessionCache("europe")
+	source := &recordingSessionSource{valid: map[string]bool{"t1": true, "t2": true}}
+	c.put(Session{UserID: "u1", TokenHash: "t1", Region: "europe"}, clock.now())
+	c.put(Session{UserID: "u2", TokenHash: "t2", Region: "europe"}, clock.now())
+	for elapsed := time.Duration(0); elapsed <= sessionCacheIdle+sessionCacheTTL; elapsed += sessionCacheTTL / 2 {
+		clock.advance(sessionCacheTTL / 2)
+		if err := c.revalidate(context.Background(), source); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := c.get("t1"); !ok {
+			t.Fatalf("t1 is used continuously and must stay cached (after %v)", elapsed)
+		}
+	}
+	if len(source.last) != 1 || source.last[0] != "t1" {
+		t.Fatalf("last revalidation sent %v, want only t1", source.last)
+	}
+	if _, ok := c.get("t2"); ok {
+		t.Fatal("an idle entry must be dropped")
+	}
+}
+
+// キャッシュするリージョンでは確かめ直し専用のプールを開き、しないリージョンでは接続を増やさない（#121）。
+func TestOpenSessionCacheDB(t *testing.T) {
+	config := &Config{Region: "europe", DBHost: "127.0.0.1", DBPort: "1", DBUser: "x", DBPassword: "x", DBName: "x", DBSSLMode: "disable"}
+	shared, err := openDB(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shared.Close()
+	dedicated := openSessionCacheDB(config, shared)
+	if dedicated == shared {
+		t.Fatal("europe must use a dedicated pool")
+	}
+	defer dedicated.Close()
+	if got := dedicated.Stats().MaxOpenConnections; got != sessionCacheMaxInFlight {
+		t.Fatalf("dedicated pool max open = %d, want %d", got, sessionCacheMaxInFlight)
+	}
+	config.Region = "asia"
+	if openSessionCacheDB(config, shared) != shared {
+		t.Fatal("asia does not cache sessions and must not open another pool")
+	}
+}
