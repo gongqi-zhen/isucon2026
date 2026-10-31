@@ -35,14 +35,15 @@ for i in $(seq 1 24); do date +%T; curl -s 127.0.0.1:6060/debug/vars | jq -c '{d
 
 ### DB の接続数（`ISUREAL_DB_MAX_CONNS`）
 - 走行の前後で `isureal_db.WaitCount` が増えていれば、接続が足りずに待っています。`WaitDuration` の増分 ÷ `WaitCount` の増分が、1回あたりの待ちです。
-- 今の設定は asia1 = 24、europe1 = america1 = 40（各サーバの `~/env.sh`。合計 104）。asia1 はリクエストが europe1 の 12〜15 倍（#35）です。
+- 今の設定は asia1 = 40、europe1 = america1 = 32（各サーバの `~/env.sh`。合計 104。#125 で asia1 = 24、europe1 = america1 = 40 から変えた）。asia1 はリクエストが europe1 の 12〜15 倍（#35）です。
 - asia1 で待ちが出ていれば、合計を増やさずに配分を変えます（例：asia1 = 40、europe1 = america1 = 32）。PostgreSQL の接続1本は約 12MB で、asia2 は OOM を起こしたことがあります（#16 のコメント）。全台の合計が `max_connections = 256` と asia2 のメモリに収まることを、asia2 の `free -m` で確かめます。
 - europe1 と america1 で `WaitCount` が 0 のままなら、その分を asia1 に回せます。
 
 ### 画像本体のキャッシュ（`ISUREAL_IMAGE_CACHE_BYTES`、既定 512MB）
 - `image_object.evictions` が走行の間に増え続けていれば、上限に当たっています。`misses` のうち追い出しが原因の分は、DB からリージョンをまたいで読み直しています（1枚 約450KB）。
-- asia1 は空きメモリ 約3GiB、`GOMEMLIMIT=2GiB` なので、1GiB まで増やせます。europe1 と america1 も同程度の空きがあります（`GOMEMLIMIT` は drop-in で 2600MiB）。
+- asia1 は `GOMEMLIMIT=2GiB` で、走行の後のアプリの RSS は約 2.0GB、空きメモリ（available）は約 1.2GiB（#125）。増やすなら `GOMEMLIMIT` も上げないと GC が増えます。europe1 と america1 は drop-in で 1.5GiB（`GOMEMLIMIT` は 2600MiB）。
 - `evictions` が 0 で `cost` が `max_cost` に届いていなければ、増やしても効果はありません。
+- 初期化でキャッシュは空になるので、走行の始めの `misses` は初めて読む画像の分です。上限を上げて減るのは、追い出した後に読み直す分だけです。
 
 ### 署名のキャッシュ（`signed_url`、`verified_signature`）
 - `misses` が多ければ、その回数だけ HMAC を 1,000 回計算しています（#71）。`evictions` が増えていれば上限（200,000 件）を増やします。

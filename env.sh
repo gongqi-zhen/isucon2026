@@ -5,3 +5,5 @@ ISUREAL_DB_USER=isureal
 ISUREAL_DB_PASSWORD=isureal
 ISUREAL_DB_NAME=isureal
 ISUREAL_LOG_LEVEL=info
+# asia1 の値。europe1 と america1 の env.sh は 32（合計 104。asia2 のメモリに収める）。#125、docs/metrics.md
+ISUREAL_DB_MAX_CONNS=40
