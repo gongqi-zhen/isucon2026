@@ -18,6 +18,16 @@ LANGUAGE plpgsql AS $$
 DECLARE
   t timestamptz;
 BEGIN
+  -- 代案（#111、有効にしていない）：synchronous_commit = off を DB 全体（etc/postgresql/conf.d/isucon.conf、#100）
+  -- ではなく、この関数のトランザクションだけに効かせる。通知の一括挿入（そのリージョンの全利用者分）で WAL が
+  -- いちばん大きくなるのはこの関数なので、ここだけ COMMIT の fsync を待たなければ、前の投稿期間の行のロックを
+  -- 持つ時間と、admin の応答を短くできる。ほかの書き込みは fsync を待つままなので、クラッシュで失われうるのは
+  -- 投稿期間の開始だけになる。
+  -- 3つ目の引数 true は SET LOCAL と同じで、トランザクションが終わると元に戻る。COMMIT はトランザクションの
+  -- 一部なので、この設定のまま行われる（ALTER FUNCTION ... SET は関数を抜けるときに戻るので効かない）。
+  -- DB 全体を off にしているあいだは意味がないので、isucon.conf の設定を戻すときに、代わりにこちらを有効にするかを決める。
+  -- PERFORM set_config('synchronous_commit', 'off', true);
+
   -- users のテーブルロックは登録やプロフィール更新まで止めてしまうので使わない。
   PERFORM pg_advisory_xact_lock(hashtext('posting_window:' || p_region));
   IF EXISTS(SELECT 1 FROM posting_windows WHERE region = p_region AND local_date >= p_local_date) THEN
