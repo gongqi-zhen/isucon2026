@@ -79,6 +79,8 @@ ALTER TABLE notifications DROP CONSTRAINT IF EXISTS notifications_user_id_postin
 
 -- 2人の users 行を、Go の文字列比較と同じ順（COLLATE "C"）で FOR NO KEY UPDATE ロックする。
 -- 2人とも active ならロックして true を返す。
+-- 友達の解除、ブロック、ブロックの解除で使う。友達の解除とブロックは閲覧やコメントの権限を減らすので、
+-- 権限を確かめるコメント・RealMoji（投稿者を FOR SHARE）と直列にする必要がある。
 CREATE OR REPLACE FUNCTION isureal_lock_user_pair(a text, b text) RETURNS boolean
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -90,6 +92,45 @@ BEGIN
   RETURN n = 2;
 END $$;
 
+-- 行為者の users 行を FOR NO KEY UPDATE、相手の行を FOR SHARE で、isureal_lock_user_pair と同じ順（COLLATE "C"）にロックする（#87）。
+-- 2人とも active ならロックして true を返す。同じ人どうしなら、isureal_lock_user_pair と同じく false を返す。
+-- フォロー・フォローの解除・友達申請・申請の承認・拒否・取り下げで使う。どれも閲覧やコメントの権限を減らさない。
+-- - 相手の FOR SHARE は、相手が関わるブロックや友達の解除（isureal_lock_user_pair）、相手の退会や認定（UPDATE users）とはぶつかるので、
+--   それらとの順序は今まで通り保たれる。
+-- - ほかの行為者からの同じ相手への操作や、相手の投稿へのコメント・RealMoji（投稿者を FOR SHARE）とはぶつからず、並行して進む。
+-- - 同じ行為者の操作どうしは、行為者の行の FOR NO KEY UPDATE で直列になる。
+-- - 同じ2人の間の操作は、行為者がどちらでも、どちらかの行で FOR NO KEY UPDATE と FOR SHARE がぶつかるので直列になる。
+-- モードの違う2行は1文ではロックできないので、isureal_lock_interaction_users と同じく2文に分ける。
+CREATE OR REPLACE FUNCTION isureal_lock_actor_and_target(actor text, target text) RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+  first_id text;
+  second_id text;
+BEGIN
+  IF actor = target THEN
+    RETURN false;
+  END IF;
+  IF actor COLLATE "C" < target COLLATE "C" THEN
+    first_id := actor; second_id := target;
+  ELSE
+    first_id := target; second_id := actor;
+  END IF;
+  IF first_id = actor THEN
+    PERFORM 1 FROM users u WHERE u.id = first_id AND u.status = 'active' FOR NO KEY UPDATE;
+  ELSE
+    PERFORM 1 FROM users u WHERE u.id = first_id AND u.status = 'active' FOR SHARE;
+  END IF;
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+  IF second_id = actor THEN
+    PERFORM 1 FROM users u WHERE u.id = second_id AND u.status = 'active' FOR NO KEY UPDATE;
+  ELSE
+    PERFORM 1 FROM users u WHERE u.id = second_id AND u.status = 'active' FOR SHARE;
+  END IF;
+  RETURN FOUND;
+END $$;
+
 CREATE OR REPLACE FUNCTION isureal_is_blocked(a text, b text) RETURNS boolean
 LANGUAGE sql STABLE AS $$
   SELECT EXISTS(SELECT 1 FROM block_relations br WHERE (br.blocker_id = a AND br.blocked_id = b) OR (br.blocker_id = b AND br.blocked_id = a))
@@ -98,13 +139,14 @@ $$;
 -- 友達申請。ブロック関係か友達関係があれば conflict。
 -- 相手からの pending の申請があれば、それを承認して友達関係を作る。自分からの pending の申請があれば conflict。
 -- どちらもなければ、新しい申請を作る。
+-- 受信者の行は FOR SHARE でロックする（#87）。同じ受信者への別々の申請者からの申請は、並行して進む。
 CREATE OR REPLACE FUNCTION isureal_create_friend_request(actor text, recipient text, new_request_id text, new_friendship_id text, low_id text, high_id text)
 RETURNS TABLE(out_result text, out_id text, out_status text, out_updated_at timestamptz)
 LANGUAGE plpgsql AS $$
 DECLARE
   p friend_requests%ROWTYPE;
 BEGIN
-  IF NOT isureal_lock_user_pair(actor, recipient) THEN
+  IF NOT isureal_lock_actor_and_target(actor, recipient) THEN
     RETURN QUERY SELECT 'not_found'::text, NULL::text, NULL::text, NULL::timestamptz;
     RETURN;
   END IF;
@@ -141,6 +183,7 @@ END $$;
 
 -- 友達申請の承認・拒否・取り下げ。申請がなければ not_found、操作する権限がなければ forbidden。
 -- ロックの後、pending でなければ forbidden、承認でブロック関係があれば conflict。
+-- 行為者でない側（承認・拒否なら申請者、取り下げなら受信者）の行は FOR SHARE でロックする（#87）。
 CREATE OR REPLACE FUNCTION isureal_transition_friend_request(actor text, request_id text, new_status text, new_friendship_id text)
 RETURNS TABLE(out_result text, out_id text, out_status text, out_updated_at timestamptz)
 LANGUAGE plpgsql AS $$
@@ -157,7 +200,8 @@ BEGIN
     RETURN QUERY SELECT 'forbidden'::text, NULL::text, NULL::text, NULL::timestamptz;
     RETURN;
   END IF;
-  IF NOT isureal_lock_user_pair(r.requester_id, r.recipient_id) THEN
+  -- 上の確認で、行為者は申請者か受信者のどちらか。
+  IF NOT isureal_lock_actor_and_target(actor, CASE WHEN actor = r.requester_id THEN r.recipient_id ELSE r.requester_id END) THEN
     RETURN QUERY SELECT 'not_found'::text, NULL::text, NULL::text, NULL::timestamptz;
     RETURN;
   END IF;
@@ -199,10 +243,11 @@ BEGIN
 END $$;
 
 -- フォロー。相手が認定公開アカウントでない、ブロック関係がある、すでにフォローしている場合は conflict。
+-- 相手の行は FOR SHARE でロックする（#87）。同じ認定公開アカウントへの別々の利用者からのフォローは、並行して進む。
 CREATE OR REPLACE FUNCTION isureal_follow(actor text, target text, new_follow_id text) RETURNS text
 LANGUAGE plpgsql AS $$
 BEGIN
-  IF NOT isureal_lock_user_pair(actor, target) THEN
+  IF NOT isureal_lock_actor_and_target(actor, target) THEN
     RETURN 'not_found';
   END IF;
   INSERT INTO follows (id, follower_id, followee_id)
@@ -216,11 +261,11 @@ BEGIN
   RETURN 'ok';
 END $$;
 
--- フォローの解除。フォローしていなければ conflict。
+-- フォローの解除。フォローしていなければ conflict。相手の行は FOR SHARE でロックする（#87）。
 CREATE OR REPLACE FUNCTION isureal_unfollow(actor text, target text) RETURNS text
 LANGUAGE plpgsql AS $$
 BEGIN
-  IF NOT isureal_lock_user_pair(actor, target) THEN
+  IF NOT isureal_lock_actor_and_target(actor, target) THEN
     RETURN 'not_found';
   END IF;
   DELETE FROM follows fo WHERE fo.follower_id = actor AND fo.followee_id = target;
