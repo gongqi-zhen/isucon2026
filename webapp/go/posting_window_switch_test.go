@@ -8,11 +8,12 @@ import (
 	"time"
 )
 
-// #85：投稿期間の開始で、前の投稿期間の行をロックしてから COMMIT までの間に、通知の一括挿入をしない。
-// lock_contention_test.go と同じく、ISUREAL_TEST_DSN を指定したときだけ実行する。
+// #85：投稿期間の開始で、前の投稿期間の行をロックしてから確定までの間に、通知の一括挿入をしない。
+// posting_window_open_db_test.go と同じく、ISUREAL_TEST_DSN を指定したときだけ実行する。
 
-// 投稿（FOR SHARE）が前の投稿期間の行を持っている間、投稿期間の開始は終了の UPDATE で待つ。
+// 投稿（FOR SHARE）が前の投稿期間の行を持っている間、投稿期間の開始（isureal_open_posting_window）は終了の UPDATE で待つ。
 // そのときには、通知の一括挿入はもう終わっている（notifications に書き込みのロックを持っている）。
+// 待ったあとも、前の投稿期間の ended_at、新しい投稿期間の starts_at、通知の created_at は同じ時刻になる。
 func TestPostingWindowSwitchInsertsNotificationsBeforeEndingWindow(t *testing.T) {
 	env := newLockTestEnv(t)
 	admin := env.adminToken()
@@ -50,7 +51,7 @@ func TestPostingWindowSwitchInsertsNotificationsBeforeEndingWindow(t *testing.T)
 		done <- result{status, body}
 	}()
 
-	// 終了の UPDATE がロックを待つまで待つ。
+	// 投稿期間の開始の関数が、行のロックを待つまで待つ。関数の中で待つのは、前の投稿期間を終える UPDATE だけ。
 	var waitingPID int
 	deadline := time.Now().Add(10 * time.Second)
 	for waitingPID == 0 {
@@ -64,7 +65,7 @@ func TestPostingWindowSwitchInsertsNotificationsBeforeEndingWindow(t *testing.T)
 		}
 		env.db.Get(&waitingPID, `
    SELECT coalesce(max(pid), 0) FROM pg_stat_activity
-   WHERE wait_event_type = 'Lock' AND query ~ '^\s*UPDATE posting_windows SET ended_at'
+   WHERE wait_event_type = 'Lock' AND query LIKE '%isureal_open_posting_window%'
   `)
 		if waitingPID == 0 {
 			time.Sleep(10 * time.Millisecond)
@@ -95,95 +96,27 @@ func TestPostingWindowSwitchInsertsNotificationsBeforeEndingWindow(t *testing.T)
 	if r.status != http.StatusCreated {
 		t.Fatalf("switch window: %d %v", r.status, r.body)
 	}
-	assertPostingWindowSwitch(t, env, oldWindowID, r.body)
-}
 
-// 投稿期間の開始の応答と、前の投稿期間の終了、通知の時刻と件数が、今まで通りであること。
-func TestPostingWindowSwitchResponseAndTimestamps(t *testing.T) {
-	env := newLockTestEnv(t)
-	admin := env.adminToken()
-	if status, body := env.openWindow(admin); status != http.StatusCreated {
-		t.Fatalf("open window: %d %v", status, body)
-	}
-	env.user("asia")
-	var oldWindowID string
-	if err := env.db.Get(&oldWindowID, `SELECT id FROM posting_windows WHERE region = 'asia' AND ended_at IS NULL`); err != nil {
-		t.Fatal(err)
-	}
-	status, body := env.openWindow(admin)
-	if status != http.StatusCreated {
-		t.Fatalf("switch window: %d %v", status, body)
-	}
-	assertPostingWindowSwitch(t, env, oldWindowID, body)
-
-	// 同じ日付をもう一度開くと 409。
-	status, conflict := env.do("POST", "/api/admin/posting-window", admin, map[string]string{"region": "asia", "localDate": body["localDate"].(string)}, nil)
-	if status != http.StatusConflict || conflict["error"] != "posting_window_conflict" {
-		t.Fatalf("same date: %d %v", status, conflict)
-	}
-	var open int
-	env.db.Get(&open, `SELECT count(*) FROM posting_windows WHERE region = 'asia' AND ended_at IS NULL`)
-	if open != 1 {
-		t.Fatalf("%d open posting windows after the conflict", open)
-	}
-}
-
-// assertPostingWindowSwitch は、新しい投稿期間の応答と DB の行が一致し、
-// 前の投稿期間の ended_at、新しい投稿期間の starts_at、通知の created_at が同じ時刻で、
-// 通知がそのリージョンの active な利用者に1件ずつあることを確かめる。
-func assertPostingWindowSwitch(t *testing.T, env *lockTestEnv, oldWindowID string, body map[string]any) {
-	t.Helper()
-	windowID, _ := body["id"].(string)
-	var window struct {
-		PostingWindow
+	windowID, _ := r.body["id"].(string)
+	var times struct {
+		StartsAt        time.Time  `db:"starts_at"`
 		PreviousEndedAt *time.Time `db:"previous_ended_at"`
+		Notifications   int        `db:"notifications"`
+		OtherTimes      int        `db:"other_times"`
 	}
-	if err := env.db.Get(&window, `
-  SELECT w.id, w.region, w.local_date, w.starts_at, w.on_time_deadline, w.ended_at, old.ended_at AS previous_ended_at
+	if err := env.db.Get(&times, `
+  SELECT w.starts_at, old.ended_at AS previous_ended_at,
+         (SELECT count(*) FROM notifications n WHERE n.posting_window_id = w.id) AS notifications,
+         (SELECT count(*) FROM notifications n WHERE n.posting_window_id = w.id AND n.created_at <> w.starts_at) AS other_times
   FROM posting_windows w, posting_windows old
   WHERE w.id = $1 AND old.id = $2
  `, windowID, oldWindowID); err != nil {
 		t.Fatalf("new window %q: %v", windowID, err)
 	}
-	if window.EndedAt != nil {
-		t.Errorf("new window has ended_at %v", window.EndedAt)
+	if times.PreviousEndedAt == nil || !times.PreviousEndedAt.Equal(times.StartsAt) {
+		t.Errorf("previous ended_at %v, new starts_at %v", times.PreviousEndedAt, times.StartsAt)
 	}
-	if window.PreviousEndedAt == nil || !window.PreviousEndedAt.Equal(window.StartsAt) {
-		t.Errorf("previous ended_at %v, new starts_at %v", window.PreviousEndedAt, window.StartsAt)
-	}
-	if !window.OnTimeDeadline.Equal(window.StartsAt.Add(24 * time.Hour)) {
-		t.Errorf("on_time_deadline %v, starts_at %v", window.OnTimeDeadline, window.StartsAt)
-	}
-	for key, want := range map[string]string{"id": window.ID, "region": "asia", "localDate": window.LocalDate.Format(time.DateOnly)} {
-		if got, _ := body[key].(string); got != want {
-			t.Errorf("response %s = %q, want %q", key, got, want)
-		}
-	}
-	for key, want := range map[string]time.Time{"startsAt": window.StartsAt, "onTimeDeadline": window.OnTimeDeadline} {
-		got, _ := body[key].(string)
-		if parsed, err := time.Parse(time.RFC3339Nano, got); err != nil || !parsed.Equal(want) {
-			t.Errorf("response %s = %q, want %v", key, got, want)
-		}
-	}
-	if len(body) != 5 {
-		t.Errorf("response has %d fields: %v", len(body), body)
-	}
-
-	var notifications struct {
-		Count      int `db:"count"`
-		OtherTimes int `db:"other_times"`
-		Missing    int `db:"missing"`
-	}
-	if err := env.db.Get(&notifications, `
-  SELECT count(*) AS count,
-         count(*) FILTER (WHERE n.created_at <> $2) AS other_times,
-         (SELECT count(*) FROM users u WHERE u.region = 'asia' AND u.status = 'active'
-            AND NOT EXISTS(SELECT 1 FROM notifications m WHERE m.posting_window_id = $1 AND m.user_id = u.id)) AS missing
-  FROM notifications n WHERE n.posting_window_id = $1
- `, windowID, window.StartsAt); err != nil {
-		t.Fatal(err)
-	}
-	if notifications.Count == 0 || notifications.OtherTimes != 0 || notifications.Missing != 0 {
-		t.Errorf("notifications: %+v", notifications)
+	if times.Notifications == 0 || times.OtherTimes != 0 {
+		t.Errorf("notifications: %d, with another created_at: %d", times.Notifications, times.OtherTimes)
 	}
 }

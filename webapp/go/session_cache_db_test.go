@@ -235,14 +235,17 @@ func TestSessionCacheDBRegionChangeHandler(t *testing.T) {
 	if status, _ := env.do("GET", "/api/me", token, nil); status != http.StatusForbidden {
 		t.Fatalf("me after moving to asia: %d, want 403", status)
 	}
-	// 表示名だけの変更は待たない。
+	// 表示名だけの変更も、キャッシュした利用者の行（#58）に反映されるまで待ってから応答する。
 	_, token2 := env.newUser()
 	start = time.Now()
 	if status, _ := env.do("PATCH", "/api/me", token2, map[string]string{"displayName": "renamed"}); status != http.StatusOK {
 		t.Fatalf("rename: %d", status)
 	}
-	if elapsed := time.Since(start); elapsed >= sessionCacheTTL {
-		t.Fatalf("display name change waited %v", elapsed)
+	if elapsed := time.Since(start); elapsed < sessionCacheTTL {
+		t.Fatalf("display name change returned after %v, want at least %v", elapsed, sessionCacheTTL)
+	}
+	if status, me := env.do("GET", "/api/me", token2, nil); status != http.StatusOK || me["displayName"] != "renamed" {
+		t.Fatalf("me after rename: %d %v", status, me)
 	}
 }
 

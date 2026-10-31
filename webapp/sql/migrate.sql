@@ -299,36 +299,47 @@ END $$;
 -- プロフィール画像の設定（putProfileImageHandler）。利用者の行がなければ not_found（404 account_not_found）。
 -- 変更前と同じ順序：本人の行をロック → 画像の INSERT → profile_image_id の更新 → 前の画像の DELETE。
 -- 前の画像の id はロックの後に読むので、同じ利用者の同時の差し替えでも、最後に設定された画像の行だけが残る。
-CREATE OR REPLACE FUNCTION isureal_put_profile_image(p_user_id text, p_image_id text, p_image bytea) RETURNS text
+-- ロックの後に読んだ利用者のリージョンも返す。アプリは、そのリージョンのセッションキャッシュに反映されるまで待ってから応答する（#58）。
+-- 返す型を変えたので、前の定義（RETURNS text）を消してから作る。
+DROP FUNCTION IF EXISTS isureal_put_profile_image(text, text, bytea);
+CREATE FUNCTION isureal_put_profile_image(p_user_id text, p_image_id text, p_image bytea)
+RETURNS TABLE(out_result text, out_region text)
 LANGUAGE plpgsql AS $$
 DECLARE
   old_image_id text;
+  user_region text;
 BEGIN
-  SELECT u.profile_image_id INTO old_image_id FROM users u WHERE u.id = p_user_id FOR NO KEY UPDATE;
+  SELECT u.profile_image_id, u.region INTO old_image_id, user_region FROM users u WHERE u.id = p_user_id FOR NO KEY UPDATE;
   IF NOT FOUND THEN
-    RETURN 'not_found';
+    RETURN QUERY SELECT 'not_found'::text, NULL::text;
+    RETURN;
   END IF;
   INSERT INTO image_objects (id, owner_user_id, data, media_type) VALUES (p_image_id, p_user_id, p_image, 'image/jpeg');
   UPDATE users SET profile_image_id = p_image_id, updated_at = clock_timestamp() WHERE id = p_user_id;
   IF old_image_id IS NOT NULL THEN
     DELETE FROM image_objects WHERE id = old_image_id;
   END IF;
-  RETURN 'ok';
+  RETURN QUERY SELECT 'ok'::text, user_region;
 END $$;
 
 -- プロフィール画像の削除（deleteProfileImageHandler）。利用者の行がないか、画像が設定されていなければ not_found（404 account_not_found）。
-CREATE OR REPLACE FUNCTION isureal_delete_profile_image(p_user_id text) RETURNS text
+-- 設定と同じく、ロックの後に読んだ利用者のリージョンも返す（#58）。
+DROP FUNCTION IF EXISTS isureal_delete_profile_image(text);
+CREATE FUNCTION isureal_delete_profile_image(p_user_id text)
+RETURNS TABLE(out_result text, out_region text)
 LANGUAGE plpgsql AS $$
 DECLARE
   old_image_id text;
+  user_region text;
 BEGIN
-  SELECT u.profile_image_id INTO old_image_id FROM users u WHERE u.id = p_user_id FOR NO KEY UPDATE;
+  SELECT u.profile_image_id, u.region INTO old_image_id, user_region FROM users u WHERE u.id = p_user_id FOR NO KEY UPDATE;
   IF NOT FOUND OR old_image_id IS NULL THEN
-    RETURN 'not_found';
+    RETURN QUERY SELECT 'not_found'::text, NULL::text;
+    RETURN;
   END IF;
   UPDATE users SET profile_image_id = NULL, updated_at = clock_timestamp() WHERE id = p_user_id;
   DELETE FROM image_objects WHERE id = old_image_id;
-  RETURN 'ok';
+  RETURN QUERY SELECT 'ok'::text, user_region;
 END $$;
 
 -- 退会（deleteAccountHandler）。active な利用者がいなければ not_found（404 account_not_found）。

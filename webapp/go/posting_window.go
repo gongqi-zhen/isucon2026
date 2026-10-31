@@ -1,8 +1,6 @@
 package isureal
 
-import (
-	"time"
-)
+import "time"
 
 type PostingWindow struct {
 	ID             string     `db:"id"`

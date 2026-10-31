@@ -11,20 +11,15 @@ import (
 
 type hookSessionSource struct {
 	valid  map[string]bool
+	users  map[string]User
 	during func()
 }
 
-func (s *hookSessionSource) validTokens(_ context.Context, _ string, tokenHashes []string) (map[string]bool, error) {
+func (s *hookSessionSource) validate(_ context.Context, _ string, checks []sessionCacheCheck) (map[string]sessionCacheValidation, error) {
 	if s.during != nil {
 		s.during()
 	}
-	result := map[string]bool{}
-	for _, tokenHash := range tokenHashes {
-		if s.valid[tokenHash] {
-			result[tokenHash] = true
-		}
-	}
-	return result, nil
+	return fakeValidate(s.valid, s.users, checks), nil
 }
 
 func TestParseSessionCacheSole(t *testing.T) {

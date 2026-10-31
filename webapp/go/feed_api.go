@@ -70,16 +70,19 @@ func buildFeed(ctx context.Context, db sqlx.QueryerContext, viewerID string, inp
 	}
 	// SQL と同じ条件で Go 側でも確認し、閲覧権限のない投稿を返さないようにする。
 	candidates := make([]PostWithAuthor, 0, len(posts))
-	for _, post := range posts {
-		if viewer.canView(post.Post) && matchesFeed(viewer, post.Post, input.Feed) {
-			candidates = append(candidates, post)
-		}
-	}
 	var scores map[string]int64
 	if ranked {
-		if scores, err = recommendationScores(ctx, db, viewer, candidates); err != nil {
-			return getFeedResponse{}, err
+		scores = make(map[string]int64, len(posts))
+	}
+	for _, post := range posts {
+		if viewer.canView(post.Post) && matchesFeed(viewer, post.Post, input.Feed) {
+			candidates = append(candidates, post.PostWithAuthor)
+			if ranked {
+				scores[post.ID] = recommendationScore(viewer, post)
+			}
 		}
+	}
+	if ranked {
 		sort.SliceStable(candidates, func(i, j int) bool {
 			return scores[candidates[i].ID] > scores[candidates[j].ID]
 		})
@@ -106,9 +109,19 @@ func buildFeed(ctx context.Context, db sqlx.QueryerContext, viewerID string, inp
 	return getFeedResponse{Items: items, HasMore: hasMore}, nil
 }
 
+// feedCandidate は候補の投稿と、friends-of-friends のスコアに使う数。
+// ほかのフィードでは、スコアに使う数は 0 のまま。
+type feedCandidate struct {
+	PostWithAuthor
+	// FriendEngagements は、閲覧者の友達のうち、この投稿に RealMoji かコメントを付けた active な利用者の数。
+	FriendEngagements int64 `db:"friend_engagements"`
+	// AuthorConnections は、作者の友達それぞれについての、閲覧者との共通の友達の数の合計（上限をかける前）。
+	AuthorConnections int64 `db:"author_connections"`
+}
+
 // feedCandidateRow は候補の投稿の1行。閲覧者の関係の一覧は1行目にだけ入る。
 type feedCandidateRow struct {
-	PostWithAuthor
+	feedCandidate
 	BlockedIDs          *string `db:"blocked_ids"`
 	FriendIDs           *string `db:"friend_ids"`
 	FriendsOfFriendsIDs *string `db:"friends_of_friends_ids"`
@@ -117,9 +130,10 @@ type feedCandidateRow struct {
 // selectFeedCandidates は、viewer.canView と matchesFeed を満たす投稿を
 // posted_at DESC, id DESC の順で SQL で絞り込んで返す。limited のときは先頭51件だけを返す。
 // 閲覧者の関係（ブロック、友達、友達の友達）も同じクエリで求めるので、DB への往復は1回で済む。
+// friends-of-friends では、スコアに使う数（feedCandidate のコメント）も同じクエリで投稿ごとに数える。
 // 閲覧者が active でないか今日まだ投稿していなければ、候補は0件になる（canView はすべて false なので）。
 // 候補が0件のときは viewer を組み立てない（呼び出し元は使わない）。
-func selectFeedCandidates(ctx context.Context, db sqlx.QueryerContext, viewerID, feed string, beforePostedAt *time.Time, beforeID string, limited bool) (viewerContext, []PostWithAuthor, error) {
+func selectFeedCandidates(ctx context.Context, db sqlx.QueryerContext, viewerID, feed string, beforePostedAt *time.Time, beforeID string, limited bool) (viewerContext, []feedCandidate, error) {
 	viewer := viewerContext{Friends: map[string]bool{}, FriendsOfFriends: map[string]bool{}, MutualFriends: map[string]int{}, Blocked: map[string]bool{}}
 	feedCondition := ""
 	switch feed {
@@ -135,6 +149,42 @@ func selectFeedCandidates(ctx context.Context, db sqlx.QueryerContext, viewerID,
 	limit := ""
 	if limited {
 		limit = "LIMIT 51"
+	}
+	// スコアの数は、旧実装（候補の作者の友達関係と、候補への RealMoji・コメントの重複なしの組を
+	// 別のクエリで読み、Go で数える）と同じ数になるように、投稿ごとに集計して返す。
+	// 行のまま返すと、作者の友達の数と反応の数だけ行が増えるので、リージョンをまたぐ転送の量を抑えるために数だけにする。
+	// mutual は viewerContext.MutualFriends と同じ（友達の友達の配列に現れる回数。閲覧者自身は除く）。
+	scoreCTE := ""
+	scoreColumns := `0::bigint AS friend_engagements, 0::bigint AS author_connections`
+	scoreJoins := ""
+	if feed == "friends-of-friends" {
+		scoreCTE = `,
+  mutual AS (
+    SELECT fof.id, count(*) AS n
+    FROM viewer, unnest(viewer.friends_of_friends) AS fof(id)
+    WHERE fof.id <> $1
+    GROUP BY fof.id
+  )`
+		scoreColumns = `engagements.n AS friend_engagements, connections.n AS author_connections`
+		scoreJoins = `
+  CROSS JOIN LATERAL (
+    SELECT count(*) AS n FROM (
+      SELECT r.reactor_id AS user_id FROM realmojis r
+      JOIN users ru ON ru.id = r.reactor_id AND ru.status = 'active'
+      WHERE r.post_id = c.id AND r.replaced_at IS NULL AND r.deleted_at IS NULL
+      UNION
+      SELECT cm.author_id FROM comments cm
+      JOIN users cu ON cu.id = cm.author_id AND cu.status = 'active'
+      WHERE cm.post_id = c.id AND cm.deleted_at IS NULL
+    ) e
+    WHERE e.user_id = ANY(viewer.friends)
+  ) engagements
+  CROSS JOIN LATERAL (
+    SELECT COALESCE(sum(m.n), 0)::bigint AS n
+    FROM friendships f
+    JOIN mutual m ON m.id = CASE WHEN f.user_low_id = c.author_id THEN f.user_high_id ELSE f.user_low_id END
+    WHERE f.user_low_id = c.author_id OR f.user_high_id = c.author_id
+  ) connections`
 	}
 	var rows []feedCandidateRow
 	if err := sqlx.SelectContext(ctx, db, &rows, fmt.Sprintf(`
@@ -176,15 +226,15 @@ func selectFeedCandidates(ctx context.Context, db sqlx.QueryerContext, viewerID,
       AND ($2::timestamptz IS NULL OR (p.posted_at, p.id) < ($2, $3))
     ORDER BY p.posted_at DESC, p.id DESC
     %s
-  )
-  SELECT c.*,
+  )%s
+  SELECT c.*, %s,
     CASE WHEN row_number() OVER first_row = 1 THEN to_json(viewer.blocked)::text END AS blocked_ids,
     CASE WHEN row_number() OVER first_row = 1 THEN to_json(viewer.friends)::text END AS friend_ids,
     CASE WHEN row_number() OVER first_row = 1 THEN to_json(viewer.friends_of_friends)::text END AS friends_of_friends_ids
-  FROM candidates c CROSS JOIN viewer
+  FROM candidates c CROSS JOIN viewer%s
   WINDOW first_row AS (ORDER BY c.posted_at DESC, c.id DESC)
   ORDER BY c.posted_at DESC, c.id DESC
- `, feedCondition, limit), viewerID, beforePostedAt, beforeID); err != nil {
+ `, feedCondition, limit, scoreCTE, scoreColumns, scoreJoins), viewerID, beforePostedAt, beforeID); err != nil {
 		return viewer, nil, err
 	}
 	if len(rows) == 0 {
@@ -199,9 +249,9 @@ func selectFeedCandidates(ctx context.Context, db sqlx.QueryerContext, viewerID,
 	if err := viewer.applyRelationLists(*first.BlockedIDs, *first.FriendIDs, *first.FriendsOfFriendsIDs); err != nil {
 		return viewer, nil, err
 	}
-	posts := make([]PostWithAuthor, len(rows))
+	posts := make([]feedCandidate, len(rows))
 	for i := range rows {
-		posts[i] = rows[i].PostWithAuthor
+		posts[i] = rows[i].feedCandidate
 		if err := posts[i].Author.setImageKey(); err != nil {
 			return viewer, nil, err
 		}
@@ -234,59 +284,9 @@ func rankedBefore(score int64, post Post, beforeScore int64, beforePostedAt time
 	return post.ID < beforeID
 }
 
-func recommendationScores(ctx context.Context, db sqlx.QueryerContext, viewer viewerContext, posts []PostWithAuthor) (map[string]int64, error) {
-	scores := make(map[string]int64, len(posts))
-	if len(posts) == 0 {
-		return scores, nil
-	}
-	authorIDs := make([]string, 0, len(posts))
-	postIDs := make([]string, 0, len(posts))
-	for _, post := range posts {
-		authorIDs = append(authorIDs, post.AuthorID)
-		postIDs = append(postIDs, post.ID)
-	}
-
-	// kind='f' は作者の友達関係（a=user_low_id, b=user_high_id）、
-	// kind='e' は投稿へのリアクションかコメント（a=post_id, b=user_id）の重複なしの組。
-	var rows []struct {
-		Kind string `db:"kind"`
-		A    string `db:"a"`
-		B    string `db:"b"`
-	}
-	if err := sqlx.SelectContext(ctx, db, &rows, `
-  SELECT 'f' AS kind, user_low_id AS a, user_high_id AS b FROM friendships
-  WHERE user_low_id = ANY($1::text[]) OR user_high_id = ANY($1::text[])
-  UNION ALL
-  (
-    SELECT 'e', r.post_id, r.reactor_id FROM realmojis r
-    JOIN users u ON u.id = r.reactor_id AND u.status = 'active'
-    WHERE r.post_id = ANY($2::text[]) AND r.replaced_at IS NULL AND r.deleted_at IS NULL
-    UNION
-    SELECT 'e', c.post_id, c.author_id FROM comments c
-    JOIN users u ON u.id = c.author_id AND u.status = 'active'
-    WHERE c.post_id = ANY($2::text[]) AND c.deleted_at IS NULL
-  )
- `, authorIDs, postIDs); err != nil {
-		return nil, err
-	}
-	connections := map[string]int64{}
-	friendEngagements := map[string]int64{}
-	for _, row := range rows {
-		switch row.Kind {
-		case "f":
-			connections[row.A] += int64(viewer.MutualFriends[row.B])
-			connections[row.B] += int64(viewer.MutualFriends[row.A])
-		case "e":
-			if viewer.Friends[row.B] {
-				friendEngagements[row.A]++
-			}
-		}
-	}
-
-	for _, post := range posts {
-		scores[post.ID] = 10*friendEngagements[post.ID] + 3*int64(viewer.MutualFriends[post.AuthorID]) + min(connections[post.AuthorID], 30)
-	}
-	return scores, nil
+// recommendationScore は friends-of-friends のスコア。数は selectFeedCandidates が同じクエリで数えている。
+func recommendationScore(viewer viewerContext, post feedCandidate) int64 {
+	return 10*post.FriendEngagements + 3*int64(viewer.MutualFriends[post.AuthorID]) + min(post.AuthorConnections, 30)
 }
 
 // matchesFeed は SQL での絞り込みを Go 側で再確認する。following は SQL の follows で絞り込み済み。

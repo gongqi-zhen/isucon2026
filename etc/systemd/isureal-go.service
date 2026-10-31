@@ -10,6 +10,11 @@ WorkingDirectory=/home/isucon/webapp/go
 EnvironmentFile=/home/isucon/env.sh
 # env.sh に無い場合の既定値。EnvironmentFile の値が優先される。
 Environment=ISUREAL_LOG_LEVEL=info
+# GC の回数を減らす（#71）。asia1、europe1、america1 は、アプリを動かしたままで空きメモリが約 3GiB ある（docs/asia-role-split.md）。
+# ヒープは GOGC=400 で生きている分の5倍まで育てるが、GOMEMLIMIT で 2GiB に抑える。nginx などの分を残す。
+# asia2 は PostgreSQL のページキャッシュを削らないように、drop-in（10-asia2.conf）で上書きする。
+Environment=GOGC=400
+Environment=GOMEMLIMIT=2GiB
 ExecStart=/home/isucon/webapp/go/isureal
 Restart=on-failure
 RestartSec=5

@@ -1,6 +1,8 @@
 package isureal
 
 import (
+	"database/sql"
+	"errors"
 	"net/http"
 
 	"github.com/labstack/echo/v5"
@@ -16,17 +18,18 @@ func certifyUserHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := c.Bind(&input); err != nil {
 			return err
 		}
-		result, err := h.DB.ExecContext(c.Request().Context(), `UPDATE users SET account_type='certified_public', updated_at=clock_timestamp() WHERE id=$1 AND status='active' AND account_type='regular'`, input.UserID)
-		if err != nil {
-			return err
-		}
-		count, err := result.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if count == 0 {
+		ctx := c.Request().Context()
+		var region string
+		err := h.DB.GetContext(ctx, &region, `UPDATE users SET account_type='certified_public', updated_at=clock_timestamp() WHERE id=$1 AND status='active' AND account_type='regular' RETURNING region`, input.UserID)
+		if errors.Is(err, sql.ErrNoRows) {
 			return NewAPIError(http.StatusConflict, "certification_conflict")
 		}
+		if err != nil {
+			return err
+		}
+		// accountType の変更が、その利用者のリージョンのセッションキャッシュ（#58）に反映されるまで待つ。
+		// admin のリクエストは、どのサーバにも届きうる。
+		waitSessionInvalidation(ctx, region, input.UserID)
 		return c.NoContent(http.StatusNoContent)
 	}
 }

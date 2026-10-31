@@ -3,6 +3,7 @@ package isureal
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -11,24 +12,48 @@ import (
 type fakeSessionSource struct {
 	mu    sync.Mutex
 	valid map[string]bool
+	// users は、トークンごとの利用者の今の行（#58）。ないトークンでは、利用者の行を返さない。
+	users map[string]User
 	err   error
 	calls int
 }
 
-func (s *fakeSessionSource) validTokens(_ context.Context, _ string, tokenHashes []string) (map[string]bool, error) {
+func (s *fakeSessionSource) validate(_ context.Context, _ string, checks []sessionCacheCheck) (map[string]sessionCacheValidation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls++
 	if s.err != nil {
 		return nil, s.err
 	}
-	result := map[string]bool{}
-	for _, tokenHash := range tokenHashes {
-		if s.valid[tokenHash] {
-			result[tokenHash] = true
+	return fakeValidate(s.valid, s.users, checks), nil
+}
+
+// fakeValidate は、dbSessionCacheSource と同じく、fingerprint が変わった利用者の行だけを返す。
+func fakeValidate(valid map[string]bool, users map[string]User, checks []sessionCacheCheck) map[string]sessionCacheValidation {
+	result := map[string]sessionCacheValidation{}
+	for _, check := range checks {
+		if !valid[check.TokenHash] {
+			continue
 		}
+		validation := sessionCacheValidation{}
+		if user, ok := users[check.TokenHash]; ok {
+			validation.Fingerprint = fakeFingerprint(user)
+			if validation.Fingerprint != check.Fingerprint {
+				validation.User = &user
+			}
+		}
+		result[check.TokenHash] = validation
 	}
-	return result, nil
+	return result
+}
+
+func fakeFingerprint(user User) string {
+	return fmt.Sprintf("%q", []string{user.ID, user.DisplayName, user.Bio, fmt.Sprint(user.ProfileImageID), user.Region, user.AccountType, user.Status})
+}
+
+// cachedSession は、利用者の行を持つセッション（getSessionFromHeader が put するもの）を作る。
+func cachedSession(tokenHash string, user User) Session {
+	return Session{UserID: user.ID, TokenHash: tokenHash, Region: user.Region, User: &user, userFingerprint: fakeFingerprint(user)}
 }
 
 type fakeClock struct{ t time.Time }
@@ -159,5 +184,110 @@ func TestWaitSessionInvalidation(t *testing.T) {
 	waitSessionInvalidation(context.Background(), "europe", "nobody")
 	if elapsed := time.Since(start); elapsed < sessionCacheTTL {
 		t.Fatalf("europe waited %v, want at least %v", elapsed, sessionCacheTTL)
+	}
+}
+
+func TestSessionCacheKeepsUserRowWithSession(t *testing.T) {
+	c, clock := newTestSessionCache("europe")
+	user := User{ID: "u1", DisplayName: "before", Region: "europe", Status: "active"}
+	c.put(cachedSession("t1", user), clock.now())
+	s, ok := c.get("t1")
+	if !ok || s.User == nil || s.User.DisplayName != "before" {
+		t.Fatalf("get = %+v, %v; want the cached user row", s, ok)
+	}
+	s.User.DisplayName = "mutated"
+	if s2, _ := c.get("t1"); s2.User.DisplayName != "before" {
+		t.Fatal("get must return a copy of the user row")
+	}
+}
+
+// 確かめ直しは、fingerprint が変わった利用者の行だけを受け取り、validatedAt と一緒に置き換える。
+func TestSessionCacheRevalidateRefreshesUserRow(t *testing.T) {
+	c, clock := newTestSessionCache("europe")
+	user := User{ID: "u1", DisplayName: "before", Region: "europe", Status: "active"}
+	source := &fakeSessionSource{valid: map[string]bool{"t1": true}, users: map[string]User{"t1": user}}
+	c.put(cachedSession("t1", user), clock.now())
+
+	clock.advance(sessionCacheInterval)
+	if err := c.revalidate(context.Background(), source); err != nil {
+		t.Fatal(err)
+	}
+	if s, ok := c.get("t1"); !ok || s.User == nil || s.User.DisplayName != "before" {
+		t.Fatalf("unchanged row: get = %+v, %v", s, ok)
+	}
+
+	changed := user
+	changed.DisplayName = "after"
+	source.users["t1"] = changed
+	clock.advance(sessionCacheInterval)
+	if err := c.revalidate(context.Background(), source); err != nil {
+		t.Fatal(err)
+	}
+	if s, ok := c.get("t1"); !ok || s.User == nil || s.User.DisplayName != "after" {
+		t.Fatalf("changed row: get = %+v, %v; want the new display name", s, ok)
+	}
+}
+
+// 書く側がコミットして TTL 待った後は、コミットより前に読んだ利用者の行は使われない（約束1と2）。
+func TestSessionCacheStaleUserRowExpiresBeforeWriterResponds(t *testing.T) {
+	c, clock := newTestSessionCache("europe")
+	user := User{ID: "u1", DisplayName: "before", Region: "europe", Status: "active"}
+	sentBeforeCommit := clock.now()
+	clock.advance(50 * time.Millisecond) // ほかのプロセスで、表示名の変更をコミットした
+	commit := clock.now()
+	clock.advance(30 * time.Millisecond)
+	c.put(cachedSession("t1", user), sentBeforeCommit) // 遅れていた読み取りが、古い行を入れる
+	clock.t = commit.Add(sessionCacheTTL)              // 書く側が応答した時刻
+	clock.advance(time.Nanosecond)
+	if s, ok := c.get("t1"); ok {
+		t.Fatalf("a user row read before the commit must not be used after the writer responds: %+v", s.User)
+	}
+}
+
+// 確かめ直しのクエリを送った後に、エントリの行が別のクエリの（もっと古い）結果に入れ替わったときは、
+// 「変わっていない」という結果でその行を確かめたことにしない。
+func TestSessionCacheRevalidateDropsRowReplacedDuringQuery(t *testing.T) {
+	c, clock := newTestSessionCache("europe")
+	current := User{ID: "u1", DisplayName: "current", Region: "europe", Status: "active"}
+	stale := current
+	stale.DisplayName = "stale"
+	c.put(cachedSession("t1", current), clock.now())
+	staleSentAt := clock.now().Add(time.Millisecond)
+	clock.advance(sessionCacheInterval)
+	source := &hookSessionSource{
+		valid: map[string]bool{"t1": true},
+		during: func() {
+			// クエリの途中で、確かめ直しより前に送った別のクエリの結果が、新しい validatedAt で入る。
+			clock.advance(5 * time.Millisecond)
+			c.put(cachedSession("t1", stale), staleSentAt.Add(sessionCacheInterval-2*time.Millisecond))
+		},
+	}
+	source.users = map[string]User{"t1": current}
+	if err := c.revalidate(context.Background(), source); err != nil {
+		t.Fatal(err)
+	}
+	if s, ok := c.get("t1"); ok && s.User != nil && s.User.DisplayName == "stale" {
+		t.Fatal("a row that the revalidation did not check must not be extended")
+	}
+}
+
+func TestSessionCachePutReplacesUserRowOnlyWithNewerQuery(t *testing.T) {
+	c, clock := newTestSessionCache("europe")
+	before := User{ID: "u1", DisplayName: "before", Region: "europe", Status: "active"}
+	after := before
+	after.DisplayName = "after"
+	older := clock.now()
+	clock.advance(10 * time.Millisecond)
+	c.put(cachedSession("t1", after), clock.now())
+	c.put(cachedSession("t1", before), older)
+	if s, _ := c.get("t1"); s.User.DisplayName != "after" {
+		t.Fatalf("an older query replaced the row: %q", s.User.DisplayName)
+	}
+	clock.advance(10 * time.Millisecond)
+	newer := after
+	newer.Bio = "newer"
+	c.put(cachedSession("t1", newer), clock.now())
+	if s, _ := c.get("t1"); s.User.Bio != "newer" {
+		t.Fatalf("a newer query did not replace the row: %+v", s.User)
 	}
 }

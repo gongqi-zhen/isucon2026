@@ -159,6 +159,11 @@ func getMeHandler(h *HandlerContext) echo.HandlerFunc {
 		if session == nil {
 			return NewAPIError(http.StatusUnauthorized, "invalid_session")
 		}
+		// europe と america では、セッションと一緒に読んだ（キャッシュした）利用者の行を使い、DB を引かない（#58）。
+		// その行は、セッションを有効と確かめたのと同じクエリで読んだもので、利用者の行を変える操作は反映を待ってから応答する。
+		if session.User != nil {
+			return c.JSON(http.StatusOK, newGetMeResponse(*session.User))
+		}
 		user, err := getUser(c.Request().Context(), h.DB, session.UserID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewAPIError(http.StatusNotFound, "account_not_found")
@@ -216,10 +221,9 @@ func updateMeHandler(h *HandlerContext) echo.HandlerFunc {
 		if err := user.setImageKey(); err != nil {
 			return err
 		}
-		if input.Region != nil && *input.Region != session.Region {
-			// 移る前のリージョンのプロセスにキャッシュがあれば、使われなくなるまで待つ。
-			waitSessionInvalidation(ctx, session.Region, session.UserID)
-		}
+		// 変更前のリージョンのプロセスのキャッシュ（セッションと利用者の行。#58）が、使われなくなるまで待つ。
+		// リージョンを変えたときは、移る前のリージョンのプロセスにセッションが残らないようにもなる。
+		waitSessionInvalidation(ctx, session.Region, session.UserID)
 		return c.JSON(http.StatusOK, updateMeResponse(newGetMeResponse(user)))
 	}
 }

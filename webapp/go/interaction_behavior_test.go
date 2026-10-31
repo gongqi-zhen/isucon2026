@@ -9,7 +9,7 @@ import (
 
 // #50 の、投稿・RealMoji・コメントの挙動テスト。
 // 関数1回の呼び出しに書き換える前の main でも、書き換えた後でも同じ結果になることを確かめる。
-// ISUREAL_TEST_DSN に、001-schema.sql、migrate.sql、interaction_functions.sql を流した DB を指定したときだけ実行する。
+// ISUREAL_TEST_DSN に、001-schema.sql、migrate.sql、interaction_functions.sql、posting_window_functions.sql を流した DB を指定したときだけ実行する。
 
 var postForm = map[string]string{"visibility": "public", "location_kind": "none"}
 
