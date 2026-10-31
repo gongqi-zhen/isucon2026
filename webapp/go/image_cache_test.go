@@ -125,14 +125,14 @@ func TestSignedImageURLRemembersOwnerKey(t *testing.T) {
 	resetImageCaches()
 	t.Cleanup(resetImageCaches)
 	hash := sha256.Sum256([]byte("owner-secret"))
-	user := User{SecretKeyHash: hex.EncodeToString(hash[:])}
+	user := User{ID: "owner-1", SecretKeyHash: hex.EncodeToString(hash[:])}
 	if err := user.setImageKey(); err != nil {
 		t.Fatal(err)
 	}
 	signedImageURL(user, "image-1")
 	got, ok := imageOwnerKeyCache.Get("image-1")
-	if !ok || got != user.SecretKeyHash {
-		t.Fatalf("owner key = %q, %v", got, ok)
+	if !ok || got.SecretKeyHash != user.SecretKeyHash || got.OwnerID != user.ID {
+		t.Fatalf("owner = %+v, %v", got, ok)
 	}
 
 	// 鍵が無いユーザー（ゼロ値）では覚えない。
