@@ -36,9 +36,9 @@ func NewServer(config *Config) *echo.Echo {
 		panic("failed to open database: " + err.Error())
 	}
 	// idle を MaxOpen と揃え、リージョンをまたぐ接続の作り直しを防ぐ。
-	// 3 台分の合計が PostgreSQL の max_connections (etc/postgresql/conf.d/isucon.conf) を超えないこと。
-	db.SetMaxOpenConns(64)
-	db.SetMaxIdleConns(64)
+	// 全台の合計が PostgreSQL の max_connections (etc/postgresql/conf.d/isucon.conf) を超えないこと。
+	db.SetMaxOpenConns(config.DBMaxConns)
+	db.SetMaxIdleConns(config.DBMaxConns)
 	db.SetConnMaxLifetime(10 * time.Minute)
 	db.SetConnMaxIdleTime(5 * time.Minute)
 	err = db.Ping()
