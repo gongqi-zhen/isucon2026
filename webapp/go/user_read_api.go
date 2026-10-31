@@ -151,14 +151,9 @@ func getUserHandler(h *HandlerContext) echo.HandlerFunc {
 // 変更前は getUser、isBlocked、getFriendIDs の3往復だった。
 // 利用者が active でないか、どちらかの向きでブロックしていれば sql.ErrNoRows を返す。
 // 友達でも認定公開アカウントでもなければ、自己紹介を空にする。
-func loadProfileUser(ctx context.Context, db sqlx.QueryerContext, viewerID, userID string) (User, error) {
-	var row struct {
-		User
-		Blocked bool `db:"blocked"`
-		Friend  bool `db:"friend"`
-	}
-	if err := sqlx.GetContext(ctx, db, &row, `
-  SELECT `+qualifiedUserColumns("u")+`,
+// クエリの文字列は起動時に1回だけ組み立てる（#112）。
+var loadProfileUserQuery = `
+  SELECT ` + qualifiedUserColumns("u") + `,
     EXISTS(
       SELECT 1 FROM block_relations b
       WHERE (b.blocker_id = $1 AND b.blocked_id = u.id) OR (b.blocker_id = u.id AND b.blocked_id = $1)
@@ -168,7 +163,15 @@ func loadProfileUser(ctx context.Context, db sqlx.QueryerContext, viewerID, user
       WHERE (f.user_low_id = $1 AND f.user_high_id = u.id) OR (f.user_high_id = $1 AND f.user_low_id = u.id)
     ) AS friend
   FROM users u WHERE u.id = $2 AND u.status = 'active'
- `, viewerID, userID); err != nil {
+ `
+
+func loadProfileUser(ctx context.Context, db sqlx.QueryerContext, viewerID, userID string) (User, error) {
+	var row struct {
+		User
+		Blocked bool `db:"blocked"`
+		Friend  bool `db:"friend"`
+	}
+	if err := sqlx.GetContext(ctx, db, &row, loadProfileUserQuery, viewerID, userID); err != nil {
 		return User{}, err
 	}
 	user := row.User
@@ -185,5 +188,5 @@ func loadProfileUser(ctx context.Context, db sqlx.QueryerContext, viewerID, user
 }
 
 func newRelationshipUserResponse(user User) relationshipUserResponse {
-	return relationshipUserResponse{ID: user.ID, Username: user.Username, DisplayName: user.DisplayName, ProfileImageURL: newGetMeResponse(user).ProfileImageURL, Bio: user.Bio, AccountType: user.AccountType}
+	return relationshipUserResponse{ID: user.ID, Username: user.Username, DisplayName: user.DisplayName, ProfileImageURL: profileImageURL(user), Bio: user.Bio, AccountType: user.AccountType}
 }

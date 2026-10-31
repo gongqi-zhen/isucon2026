@@ -37,6 +37,14 @@ func GetSession(c *echo.Context) *Session {
 	return sess
 }
 
+// sessionWithUserQuery は、セッションと利用者の行を一緒に読むクエリ（キャッシュするリージョン用、#58）。起動時に1回だけ組み立てる（#112）。
+var sessionWithUserQuery = `
+		SELECT s.user_id, s.token_hash, s.created_at, u.region, ` + userColumnsAs("u", "user") + `, ` + sessionUserFingerprint + ` AS fingerprint
+		FROM login_sessions s JOIN users u ON u.id = s.user_id
+		WHERE s.token_hash = $1
+		  AND s.active = true AND u.status = 'active'
+	`
+
 func getSessionFromHeader(c *echo.Context, h *HandlerContext) (*Session, error) {
 	authHeader := c.Request().Header.Get(echo.HeaderAuthorization)
 	if authHeader == "" {
@@ -78,12 +86,7 @@ func getSessionFromHeader(c *echo.Context, h *HandlerContext) (*Session, error) 
 		Fingerprint string `db:"fingerprint"`
 	}
 	sentAt := time.Now()
-	err := h.DB.GetContext(c.Request().Context(), &row, `
-		SELECT s.user_id, s.token_hash, s.created_at, u.region, `+userColumnsAs("u", "user")+`, `+sessionUserFingerprint+` AS fingerprint
-		FROM login_sessions s JOIN users u ON u.id = s.user_id
-		WHERE s.token_hash = $1
-		  AND s.active = true AND u.status = 'active'
-	`, tokenHash)
+	err := h.DB.GetContext(c.Request().Context(), &row, sessionWithUserQuery, tokenHash)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

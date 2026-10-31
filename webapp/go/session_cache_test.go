@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -73,6 +74,9 @@ func newTestSessionCache(region string) (*sessionCache, *fakeClock) {
 }
 
 func TestSessionCacheRegionsDefault(t *testing.T) {
+	if value := os.Getenv("ISUREAL_SESSION_CACHE_REGIONS"); value != "" {
+		t.Skipf("ISUREAL_SESSION_CACHE_REGIONS=%q overrides the default", value)
+	}
 	if !sessionCacheRegions["europe"] || !sessionCacheRegions["america"] || sessionCacheRegions["asia"] {
 		t.Fatalf("default cache regions = %v, want europe and america only", sessionCacheRegions)
 	}
@@ -289,5 +293,89 @@ func TestSessionCachePutReplacesUserRowOnlyWithNewerQuery(t *testing.T) {
 	c.put(cachedSession("t1", newer), clock.now())
 	if s, _ := c.get("t1"); s.User.Bio != "newer" {
 		t.Fatalf("a newer query did not replace the row: %+v", s.User)
+	}
+}
+
+// #110：sessionCacheIdle を超えて使われていないエントリは、確かめ直しの対象から外れて消える。
+// 使われ続けるエントリは残り、確かめ直される。
+func TestSessionCacheIdleEntriesAreDroppedFromRevalidation(t *testing.T) {
+	c, clock := newTestSessionCache("europe")
+	source := &fakeSessionSource{valid: map[string]bool{"used": true, "idle": true}}
+	c.put(Session{UserID: "u1", TokenHash: "used", Region: "europe"}, clock.now())
+	c.put(Session{UserID: "u2", TokenHash: "idle", Region: "europe"}, clock.now())
+
+	// 期限の直前までは、どちらも確かめ直しの対象。used だけがここで使われる。
+	clock.advance(sessionCacheIdle - time.Millisecond)
+	c.get("used")
+	if checks := c.checks(); len(checks) != 2 {
+		t.Fatalf("both entries are within the idle limit, checks = %v", checks)
+	}
+	// idle は期限を超えたので、確かめ直さずに消える。
+	clock.advance(2 * time.Millisecond)
+	checks := c.checks()
+	if len(checks) != 1 || checks[0].TokenHash != "used" {
+		t.Fatalf("checks = %v, want only the used entry", checks)
+	}
+	if hashes := c.tokenHashes(); len(hashes) != 1 || hashes[0] != "used" {
+		t.Fatalf("entries = %v, want the idle entry dropped", hashes)
+	}
+	// 使われ続けるエントリは、期限を何度またいでも残る。
+	for range 3 {
+		clock.advance(sessionCacheIdle - time.Millisecond)
+		c.get("used")
+		if checks := c.checks(); len(checks) != 1 {
+			t.Fatalf("the used entry must stay, checks = %v", checks)
+		}
+	}
+
+	// 残ったエントリは、これまでどおり確かめ直されて延びる。
+	if err := c.revalidate(context.Background(), source); err != nil {
+		t.Fatal(err)
+	}
+	clock.advance(sessionCacheTTL - time.Millisecond)
+	if _, ok := c.get("used"); !ok {
+		t.Fatal("the used entry must be revalidated and usable")
+	}
+	// 消えたトークンは、次に使われたとき DB の結果が put で入り直す。
+	if _, ok := c.get("idle"); ok {
+		t.Fatal("the dropped entry must not be usable without a new validation")
+	}
+	c.put(Session{UserID: "u2", TokenHash: "idle", Region: "europe"}, clock.now())
+	if _, ok := c.get("idle"); !ok {
+		t.Fatal("a fresh validation must re-enter the dropped token")
+	}
+}
+
+// get は、TTL を過ぎたエントリでも「使われた」とみなす（その後の DB の結果が put で入り直すため）。
+// put は、既存のエントリでも使った時刻を進める。
+func TestSessionCacheUseIsRecordedOnExpiredGetAndPut(t *testing.T) {
+	c, clock := newTestSessionCache("europe")
+	c.put(Session{UserID: "u1", TokenHash: "t1", Region: "europe"}, clock.now())
+	clock.advance(sessionCacheIdle - time.Millisecond)
+	if _, ok := c.get("t1"); ok {
+		t.Fatal("entry past TTL must not be returned")
+	}
+	clock.advance(sessionCacheIdle - time.Millisecond)
+	if checks := c.checks(); len(checks) != 1 {
+		t.Fatalf("an expired get must count as use, checks = %v", checks)
+	}
+	clock.advance(sessionCacheIdle - time.Millisecond)
+	c.put(Session{UserID: "u1", TokenHash: "t1", Region: "europe"}, clock.now())
+	clock.advance(sessionCacheIdle - time.Millisecond)
+	if checks := c.checks(); len(checks) != 1 {
+		t.Fatalf("a put must count as use, checks = %v", checks)
+	}
+	clock.advance(2 * time.Millisecond)
+	if checks := c.checks(); len(checks) != 0 {
+		t.Fatalf("checks = %v, want the entry dropped once idle", checks)
+	}
+}
+
+func TestSessionCacheIdleDefault(t *testing.T) {
+	if sessionCacheIdle != 5*time.Second {
+		t.Fatalf("sessionCacheIdle = %v, want 5s by default", sessionCacheIdle)
+	}
+	if sessionCacheIdle <= sessionCacheTTL {
+		t.Fatal("the idle limit must be longer than the TTL, or entries would be dropped before they expire")
 	}
 }
