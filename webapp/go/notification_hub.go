@@ -23,14 +23,28 @@ import (
 //     以前は各接続がそれぞれ1クエリずつ引いていたので、投稿期間の開始の直後に DB の接続プールを取り合っていた。
 //   - まとめて引けなかった接続（接続した時刻がまだ決まっていなかった接続）が自分で引くときも、
 //     同時に引くものどうしを1クエリにまとめる（notificationFetcher、#83）。
+//
+// 利用者の退会とリージョンの変更（#110）：以前は notificationUserCheckInterval（500ms）ごとに、待機中の全接続の利用者を
+// users から引き直していた。接続が 2,000 あれば毎秒 4,000 件の索引の読み取りになる。
+// 今は users の status と region の変更（と DELETE）を、migrate.sql のトリガが pg_notify で知らせる。
+// LISTEN する接続は投稿期間と同じ1本で、届いた利用者の接続だけを、以前と同じ判定（ActiveUserRegions）で確かめて閉じる。
+// ポーリングは、LISTEN の接続が切れている間と、トリガが動かない初期化（reset.sql）の取りこぼしの保険として、間隔を伸ばして残す。
 const (
 	notificationWindowPollInterval = 100 * time.Millisecond
-	notificationUserCheckInterval  = 500 * time.Millisecond
+	notificationUserCheckInterval  = 5 * time.Second
 	// 投稿期間の開始を知らせる pg_notify のチャンネル。admin_posting_window_api.go が送る。
 	postingWindowNotifyChannel = "isureal_posting_windows"
+	// 利用者の退会・リージョンの変更・削除を知らせる pg_notify のチャンネル。migrate.sql のトリガ isureal_notify_user_change が送る。
+	// ペイロードは利用者の id。
+	userChangeNotifyChannel = "isureal_users"
 	// LISTEN の接続が切れたときに、つなぎ直すまで待つ時間。
 	postingWindowListenRetry = time.Second
+	// LISTEN で届いた利用者の変更を、確かめる goroutine に渡すまでためておける数。あふれた分はポーリングが拾う。
+	userChangeQueueSize = 1024
 )
+
+// notificationListenStatement は、LISTEN する接続で実行する文。2つのチャンネルを1文で LISTEN する。
+const notificationListenStatement = "LISTEN " + postingWindowNotifyChannel + "; LISTEN " + userChangeNotifyChannel
 
 type notificationSource interface {
 	// 開いている投稿期間のIDを返す。
@@ -199,6 +213,9 @@ type NotificationHub struct {
 	// LISTEN で投稿期間の開始を受け取ったときに、すぐ確認させる。
 	wake               chan struct{}
 	windowPollInterval time.Duration
+	// LISTEN で受け取った、退会・リージョンの変更・削除があった利用者の id。runUserChanges が確かめる（#110）。
+	userChanges       chan string
+	userCheckInterval time.Duration
 	// まとめ取りの失敗を最後にログに出した時刻。run の goroutine だけが読み書きする。
 	batchErrorLoggedAt time.Time
 	// changed で知らされた接続が自分で通知を引くときに使う。source が notificationBatchSource のときだけ設定する。
@@ -209,6 +226,7 @@ func newNotificationHub(source notificationSource) *NotificationHub {
 	hub := &NotificationHub{
 		source: source, waiters: map[*notificationWaiter]struct{}{},
 		wake: make(chan struct{}, 1), windowPollInterval: notificationWindowPollInterval,
+		userChanges: make(chan string, userChangeQueueSize), userCheckInterval: notificationUserCheckInterval,
 	}
 	if batch, ok := source.(notificationBatchSource); ok {
 		hub.fetcher = newNotificationFetcher(func(ctx context.Context, keys []notificationKey) ([]*getNotificationsResponse, error) {
@@ -258,10 +276,22 @@ func (hub *NotificationHub) notifyWindowChanged() {
 	}
 }
 
+// notifyUserChanged は、LISTEN で利用者の退会・リージョンの変更・削除を受け取ったときに呼ぶ。
+// runUserChanges がその利用者の接続だけを確かめる。ためておける数を超えたら捨てる（ポーリングが拾う）。
+func (hub *NotificationHub) notifyUserChanged(userID string) {
+	select {
+	case hub.userChanges <- userID:
+	default:
+	}
+}
+
+// run は、投稿期間の確認と利用者の確認のループ。利用者の変更を LISTEN で受けたときの確認は、別の goroutine で行う。
+// europe と america では、このループは投稿期間のポーリング（100ms ごとに約100ms の往復）でほとんど埋まっているため。
 func (hub *NotificationHub) run(ctx context.Context) {
+	go hub.runUserChanges(ctx)
 	windowTicker := time.NewTicker(hub.windowPollInterval)
 	defer windowTicker.Stop()
-	userTicker := time.NewTicker(notificationUserCheckInterval)
+	userTicker := time.NewTicker(hub.userCheckInterval)
 	defer userTicker.Stop()
 	for {
 		select {
@@ -360,8 +390,30 @@ func (hub *NotificationHub) deliverPending(ctx context.Context, batch notificati
 	}
 }
 
+// checkUsers は、待機中の全接続の利用者を確かめ、退会したかリージョンが変わった利用者の接続を閉じる（ポーリング）。
 func (hub *NotificationHub) checkUsers(ctx context.Context) {
+	hub.checkWaiters(ctx, hub.snapshot())
+}
+
+// checkUsersFor は、userIDs の利用者の接続だけを確かめる（LISTEN で変更を受け取ったとき、#110）。判定は checkUsers と同じ。
+func (hub *NotificationHub) checkUsersFor(ctx context.Context, userIDs []string) {
+	changed := make(map[string]bool, len(userIDs))
+	for _, id := range userIDs {
+		changed[id] = true
+	}
 	waiters := hub.snapshot()
+	matched := make([]*notificationWaiter, 0, len(waiters))
+	for _, waiter := range waiters {
+		if changed[waiter.userID] {
+			matched = append(matched, waiter)
+		}
+	}
+	hub.checkWaiters(ctx, matched)
+}
+
+// checkWaiters は、waiters の利用者を1クエリで引き、active でないかリージョンが接続時と違う接続を閉じる。
+// クエリが失敗したときは何も閉じない（次のポーリングで確かめ直す）。
+func (hub *NotificationHub) checkWaiters(ctx context.Context, waiters []*notificationWaiter) {
 	if len(waiters) == 0 {
 		return
 	}
@@ -378,6 +430,29 @@ func (hub *NotificationHub) checkUsers(ctx context.Context) {
 		if region, ok := regions[waiter.userID]; !ok || region != waiter.region {
 			waiter.markGone()
 		}
+	}
+}
+
+// runUserChanges は、LISTEN で届いた利用者の id を受け取り、たまっている分をまとめて1クエリで確かめる。
+func (hub *NotificationHub) runUserChanges(ctx context.Context) {
+	for {
+		var userIDs []string
+		select {
+		case <-ctx.Done():
+			return
+		case id := <-hub.userChanges:
+			userIDs = append(userIDs, id)
+		}
+	drain:
+		for {
+			select {
+			case id := <-hub.userChanges:
+				userIDs = append(userIDs, id)
+			default:
+				break drain
+			}
+		}
+		hub.checkUsersFor(ctx, userIDs)
 	}
 }
 
@@ -460,9 +535,10 @@ func (f *notificationFetcher) run() {
 	}
 }
 
-// listen は、プールとは別の専用の接続で投稿期間の開始の pg_notify を待ち、受け取ったらハブにすぐ確認させる。
-// 接続が切れたらつなぎ直す。つなぎ直した直後も、切れている間の取りこぼしに備えて確認させる。
-// 切れている間も、ポーリングで検知できる。
+// listen は、プールとは別の専用の接続で、投稿期間の開始と利用者の変更の pg_notify を待つ。
+// 投稿期間の開始を受け取ったらハブにすぐ確認させ、利用者の変更を受け取ったらその利用者の接続だけを確かめさせる（#110）。
+// 接続が切れたらつなぎ直す。つなぎ直した直後も、切れている間の取りこぼしに備えて確認させる
+// （利用者の変更の取りこぼしは、ポーリングが拾う）。切れている間も、ポーリングで検知できる。
 func (hub *NotificationHub) listen(ctx context.Context, dsn string) {
 	for ctx.Err() == nil {
 		if err := hub.listenOnce(ctx, dsn); err != nil && ctx.Err() == nil {
@@ -482,14 +558,20 @@ func (hub *NotificationHub) listenOnce(ctx context.Context, dsn string) error {
 		return err
 	}
 	defer conn.Close(context.Background())
-	if _, err := conn.Exec(ctx, "LISTEN "+postingWindowNotifyChannel); err != nil {
+	if _, err := conn.Exec(ctx, notificationListenStatement); err != nil {
 		return err
 	}
 	hub.notifyWindowChanged()
 	for {
-		if _, err := conn.WaitForNotification(ctx); err != nil {
+		notification, err := conn.WaitForNotification(ctx)
+		if err != nil {
 			return err
 		}
-		hub.notifyWindowChanged()
+		switch notification.Channel {
+		case userChangeNotifyChannel:
+			hub.notifyUserChanged(notification.Payload)
+		default:
+			hub.notifyWindowChanged()
+		}
 	}
 }
