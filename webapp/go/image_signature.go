@@ -14,6 +14,15 @@ import (
 const imageURLLifetime = 24 * time.Hour
 const imageSignatureIterations = 1000
 
+// 署名付きURLの exp をこの単位で切り捨て、同じ期間内は署名を使い回す。
+// 切り捨てるので有効期限は imageURLLifetime を超えない。
+const imageURLExpGranularity = 60
+
+type signedURLEntry struct {
+	exp int64
+	sig string
+}
+
 func imageSigningKey(secretKeyHash string) ([]byte, error) {
 	key, err := hex.DecodeString(secretKeyHash)
 	if err != nil || len(key) != sha256.Size {
@@ -34,9 +43,16 @@ func imageSignature(key []byte, imageID string, exp int64) []byte {
 
 func signedImageURL(user User, imageID string) string {
 	exp := time.Now().Add(imageURLLifetime).Unix()
+	exp -= exp % imageURLExpGranularity
+	cacheKey := string(user.ImageKey) + "\x00" + imageID
+	entry, ok := signedURLCache.Get(cacheKey)
+	if !ok || entry.exp != exp {
+		entry = signedURLEntry{exp: exp, sig: base64.RawURLEncoding.EncodeToString(imageSignature(user.ImageKey, imageID, exp))}
+		signedURLCache.Add(cacheKey, entry, 1, time.Time{})
+	}
 	query := url.Values{
-		"exp": {strconv.FormatInt(exp, 10)},
-		"sig": {base64.RawURLEncoding.EncodeToString(imageSignature(user.ImageKey, imageID, exp))},
+		"exp": {strconv.FormatInt(entry.exp, 10)},
+		"sig": {entry.sig},
 	}
 	return "/api/images/" + url.PathEscape(imageID) + "?" + query.Encode()
 }
