@@ -24,7 +24,7 @@ import (
 )
 
 // #25 のロック緩和を、実際の PostgreSQL と HTTP ハンドラで確かめる。
-// ISUREAL_TEST_DSN に、001-schema.sql と migrate.sql を流した DB を指定したときだけ実行する（データは追加される）。
+// ISUREAL_TEST_DSN に、001-schema.sql、migrate.sql、posting_window_functions.sql を流した DB を指定したときだけ実行する（データは追加される）。
 //
 //	ISUREAL_TEST_DSN='postgres://isureal:isureal@127.0.0.1:55432/isureal?sslmode=disable' go test -run TestLock -v ./...
 

@@ -12,7 +12,7 @@ import (
 
 // #65（プロフィールの閲覧、RealMoji・コメントの一覧）と #66（投稿の編集・削除、RealMoji・コメントの削除）の挙動テスト。
 // DB の1往復・関数1回の呼び出しに書き換える前の main でも、書き換えた後でも同じ結果になることを確かめる。
-// ISUREAL_TEST_DSN に、001-schema.sql、migrate.sql、interaction_functions.sql を流した DB を指定したときだけ実行する。
+// ISUREAL_TEST_DSN に、001-schema.sql、migrate.sql、interaction_functions.sql、posting_window_functions.sql を流した DB を指定したときだけ実行する。
 
 const missingID = "00000000-0000-0000-0000-000000000000"
 

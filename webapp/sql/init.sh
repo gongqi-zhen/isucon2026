@@ -23,5 +23,6 @@ PGPASSWORD="$ISUREAL_DB_PASSWORD" psql \
 	--set=ON_ERROR_STOP=1 \
 	--file=migrate.sql \
 	--file=interaction_functions.sql \
+	--file=posting_window_functions.sql \
 	--file=reset.sql \
 	--file=image_invalidation.sql
